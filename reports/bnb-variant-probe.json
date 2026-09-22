@@ -1,0 +1,36 @@
+[
+  {
+    "name": "A_4bit_nf4_dq_auto",
+    "bits": 4,
+    "device_map": "auto",
+    "decode_tps": 12.34,
+    "footprint_gib": 2.62
+  },
+  {
+    "name": "B_4bit_nf4_dq_nodevicemap",
+    "bits": 4,
+    "device_map": null,
+    "decode_tps": 12.17,
+    "footprint_gib": 2.62
+  },
+  {
+    "name": "C_4bit_nf4_nodq_nodevicemap",
+    "bits": 4,
+    "device_map": null,
+    "decode_tps": 12.48,
+    "footprint_gib": 2.62
+  },
+  {
+    "name": "D_4bit_fp4_nodq_nodevicemap",
+    "bits": 4,
+    "device_map": null,
+    "decode_tps": 12.48,
+    "footprint_gib": 2.62
+  },
+  {
+    "name": "E_8bit_nodevicemap",
+    "bits": 8,
+    "device_map": null,
+    "error": "OSError: 页面文件太小，无法完成操作。 (os error 1455)"
+  }
+]

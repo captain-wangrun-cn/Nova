@@ -1,0 +1,93 @@
+{
+  "date": "2026-09-22",
+  "stage": "S2-speed-recheck",
+  "supersedes": "reports/s2-speed-diagnosis.md sections 1-5, D26 technical finding",
+  "env": {
+    "python": "H:\\Nova\\.venv\\Scripts\\python.exe (3.12.14)",
+    "torch": "2.6.0+cu124",
+    "transformers": "5.17.0",
+    "bitsandbytes": "0.50.2",
+    "torchao": "0.9.0",
+    "triton_windows_installed": "3.2.0.post21",
+    "triton_windows_incompatible": "3.8.0.post28 (cannot import name AttrsDescriptor)",
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU, 8188 MiB, sm_89"
+  },
+  "evidence_1_dll_is_cuda": {
+    "cextension.lib.type": "CudaBNBNativeLibrary",
+    "cextension.lib._lib.type": "CDLL",
+    "cextension.lib._lib._name": "H:\\Nova\\.venv\\Lib\\site-packages\\bitsandbytes\\libbitsandbytes_cuda124.dll",
+    "symbols_present": ["cgemm_4bit_inference_naive_fp16", "cgemm_4bit_fp16", "cquantize_blockwise_fp16_nf4", "cdequantize_blockwise_fp16_nf4", "cdequantize_blockwise_fp16_fp4", "cgemm_4bit_bf16", "cigemmlt_32"],
+    "symbols_absent": ["get_compute_capabilities", "cget_context"],
+    "note": "get_compute_capabilities is genuinely not exported by this DLL; bnb's BNBNativeLibrary.__getattr__ returns the same hardcoded 'CPU-only version' throw_on_call for ANY missing symbol. The error message is misleading, not a load failure."
+  },
+  "evidence_2_profiler_shows_cuda": {
+    "op": "bitsandbytes::gemm_4bit",
+    "shape": "Linear4bit(2560,2560) bs=1 fp16",
+    "calls": 200,
+    "self_cuda_ms": 14.964,
+    "self_cuda_us_per_call": 74.8,
+    "unprofiled_us_per_call": 72.7,
+    "bs512_us_per_call": 319.6,
+    "bs512_tflops": 21.0,
+    "note": "CUPTI CUDA timers only count device-side kernels. 21 TFLOPS is impossible on CPU."
+  },
+  "evidence_3_cpu_bound": {
+    "cpu_enqueue_only_ms_per_step": 76.92,
+    "wall_ms_per_step": 77.02,
+    "gpu_busy_approx_ms": 0.10,
+    "verdict": "CPU-BOUND",
+    "kernels_per_token_approx": 8000,
+    "us_per_launch_approx": 9.6
+  },
+  "evidence_4_profile_breakdown_16_tokens": {
+    "wall_ms_per_token": 78.5,
+    "tok_per_s": 12.73,
+    "peak_gib": 2.62,
+    "buckets_cuda_share": {"eager_elementwise_and_copy": 0.789, "bnb_gemm_4bit": 0.171, "sdpa_math": 0.040},
+    "top_cuda_ops_ms_over_16_tokens": {
+      "bitsandbytes::gemm_4bit": 509.00,
+      "aten::to": 223.47,
+      "aten::copy_": 210.28,
+      "aten::_to_copy": 204.05,
+      "aten::mul": 196.58,
+      "aten::_scaled_dot_product_attention_math": 106.10,
+      "aten::as_strided": 99.14,
+      "aten::pow": 96.21,
+      "aten::add": 94.98
+    },
+    "op_calls_over_16_tokens": {
+      "aten::to": 22154,
+      "aten::_to_copy": 7691,
+      "aten::copy_": 9008,
+      "aten::mul": 8736,
+      "aten::pow": 2320,
+      "aten::mean": 2320,
+      "aten::as_strided": 11774
+    },
+    "worst_cpu_per_call_us": {"bitsandbytes::gemm_4bit": 83, "aten::_local_scalar_dense": 1495},
+    "bnb_python_dispatch_cost_ms_per_token": 21
+  },
+  "excluded_fixes": [
+    {"fix": "torchao 0.9.0 int4_weight_only(group_size=128) bf16", "bs1_us": 152.3, "bs512_tflops": 5.4, "verdict": "SLOWER than bnb (69.9us)"},
+    {"fix": "torchao 0.9.0 int4_weight_only(group_size=64) bf16", "bs1_us": 131.5, "verdict": "SLOWER"},
+    {"fix": "torchao 0.9.0 int8_weight_only bf16", "bs1_us": 123.8, "verdict": "SLOWER"},
+    {"fix": "transformers cache_implementation=static + CompileConfig", "verdict": "SKIPPED: Bnb4BitHfQuantizer.is_compileable == False"},
+    {"fix": "hand-written forward + torch.compile(mode=default, dynamic=False)", "tok_per_s": 1.70, "verdict": "7x SLOWER than eager"},
+    {"fix": "hand-written forward + torch.compile(mode=reduce-overhead)", "tok_per_s": 0.21, "verdict": "60x SLOWER; cudagraphs skipped: 'cpu device (arg5_1)' + 'mutated inputs' in StaticCache"}
+  ],
+  "positive_byproduct_for_s3": {
+    "test": "hand-written per-layer forward vs HF Qwen3VLForConditionalGeneration forward",
+    "max_abs_logit_diff": 0.0,
+    "argmax": "104198 vs 104198",
+    "implication": "Self-written nn.Module forward can be bit-identical to the official one -> S3 'gated-off == baseline' criterion is reachable via the self-written route."
+  },
+  "reference_numbers": {
+    "fp16_nn_linear_2560x2560_bs1_us": 37.2,
+    "fp16_effective_bandwidth_GBps": 352.1,
+    "bnb_linear4bit_2560x2560_bs1_us": 69.9,
+    "bnb_effective_bandwidth_GBps": 46.9,
+    "text_tower_4bit_weight_bytes": "1.82 GB",
+    "bnb_in_model_effective_bandwidth_GBps": 135,
+    "linear_only_floor_at_234GBps": "8.6 ms/token = 116 tok/s"
+  }
+}

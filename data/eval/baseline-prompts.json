@@ -1,0 +1,103 @@
+{
+  "meta": {
+    "name": "nova-baseline-v1",
+    "created": "2026-09-21",
+    "model": "Qwen/Qwen3-VL-4B-Instruct",
+    "seed": 20260921,
+    "seed_policy": "每条 prompt 用 seed+index，保证与运行顺序无关、可复现",
+    "decoding": {
+      "do_sample": true,
+      "temperature": 0.7,
+      "top_p": 0.8,
+      "top_k": 20,
+      "repetition_penalty": 1.0,
+      "max_new_tokens": 256
+    },
+    "decoding_source": "模型自带 generation_config.json 的官方默认值，未做任何调参",
+    "stop_token_ids": [151645, 151643],
+    "purpose": "S2 单通路基线：英文 RP x3 + 短问答 x3。这组数字是后续所有优化的比较基准，也是 D19（是否换基座）的一半证据。",
+    "note": "短问答的 qa-03 有唯一正确答案，可直接判对错；RP 三项需人工主观评分（待实测）。"
+  },
+  "prompts": [
+    {
+      "id": "rp-01",
+      "kind": "rp",
+      "label": "英文 RP · 港口雨夜开场",
+      "system": "You are a character in an ongoing roleplay. Stay in character at all times. Write in third-person past tense. Never write the user's dialogue, thoughts, or actions. Favour concrete sensory detail over abstract summary.",
+      "turns": [
+        {
+          "role": "user",
+          "content": "Elara, the dockmaster says we still owe him for last week. He has two men with him and he is blocking the ramp."
+        }
+      ],
+      "max_new_tokens": 256
+    },
+    {
+      "id": "rp-02",
+      "kind": "rp",
+      "label": "英文 RP · 坏消息与情绪压力",
+      "system": "You are a character in an ongoing roleplay. Stay in character at all times. Write in third-person past tense. Never write the user's dialogue, thoughts, or actions. Favour concrete sensory detail over abstract summary.",
+      "turns": [
+        {
+          "role": "user",
+          "content": "Elara, the manifest you signed was not for machine parts. Kessler is dead, and his name is on the last page."
+        }
+      ],
+      "max_new_tokens": 256
+    },
+    {
+      "id": "rp-03",
+      "kind": "rp",
+      "label": "英文 RP · 讨价还价的谈判",
+      "system": "You are a character in an ongoing roleplay. Stay in character at all times. Write in third-person past tense. Never write the user's dialogue, thoughts, or actions. Favour concrete sensory detail over abstract summary.",
+      "turns": [
+        {
+          "role": "user",
+          "content": "The buyer wants to renegotiate. He says the cargo arrived wet and he is offering forty percent of the agreed price. He is smiling while he says it."
+        }
+      ],
+      "max_new_tokens": 256
+    },
+    {
+      "id": "qa-01",
+      "kind": "qa",
+      "label": "短问答 · 事实解释",
+      "system": null,
+      "turns": [
+        {
+          "role": "user",
+          "content": "In two sentences, explain why the sky looks red at sunset."
+        }
+      ],
+      "max_new_tokens": 128
+    },
+    {
+      "id": "qa-02",
+      "kind": "qa",
+      "label": "短问答 · 指令遵循（精确条数）",
+      "system": null,
+      "turns": [
+        {
+          "role": "user",
+          "content": "List exactly five uses for a paperclip. One short line each. No introduction, no closing remark."
+        }
+      ],
+      "max_new_tokens": 160
+    },
+    {
+      "id": "qa-03",
+      "kind": "qa",
+      "label": "短问答 · 多步算术（有唯一答案）",
+      "system": null,
+      "turns": [
+        {
+          "role": "user",
+          "content": "A train leaves at 14:05 and arrives at 17:50. The next one leaves 25 minutes later and takes 12 minutes longer. What time does the second train arrive? Show the arithmetic."
+        }
+      ],
+      "max_new_tokens": 192,
+      "expected_answer": "18:27",
+      "note": "2026-09-21 实测：192 token 预算不够（模型逐步推理被截断）。提高到 640 后模型给出了最终答案，但答案是 **18:17（错）** —— 它在中间步骤把 3h45m 误算成 215 分钟（正确是 225）。这是一个干净、可客观判定的基线失败点，记入报告。"
+    }
+  ]
+}
