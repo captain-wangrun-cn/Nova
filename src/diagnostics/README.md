@@ -72,9 +72,11 @@ $env:TORCHINDUCTOR_CACHE_DIR='H:\Nova\.tmp\inductor-cache'
 | `probe_memory_addressing2.py` | **决定性扫描**：6 条 × 8 问 × 12 组配置 → `alone`+按长度归一+不标准化 = **8/8**；`stack` 2/8；标准化 4/8 | 同上 |
 | `probe_memory_addressing3.py` | 查询取哪几个 token：整句取平均 8/8 掉 7/8；**末尾 4 个 token** 才对 | 同上 |
 | `probe_memory_addressing4.py` | **注入位置**：`place="front"`（插最前面）在 20 轮历史下退化到 1/3 且生成崩；`turn` 才对 | 同上 |
+| `exp_recall_baseline.py` | **对照实验（重要）**：第 1 轮**留在**上下文里、不注入记忆 → **20 轮 683 token / 60 轮 1915 / 120 轮 3785 全部 8/8**。证明 **S4 演示的 `off=0/8` 是"第 1 轮被移出上下文"的因果对照，不是"原版模型会忘"** | `& .\.venv\Scripts\python.exe src\diagnostics\exp_recall_baseline.py --turns 20 60 120` |
 
 **第四轮新增的坑：**
 
 - **同一套检索逻辑写两份必然漂移。** 第一版 `tests/test_memory.py` 自己在测试里手搓了一遍打分，忘了把 `query_span` 截成末尾 4 个 token，命中率立刻从 8/8 掉 7/8。现在检索只写一份（`MemorySession.rank()`），`prefill` 与测试都调它。
 - **取"prompt 最后 4 个 token"拿到的是 `<|im_start|>assistant\n`**（没有内容）→ 寻址退化成"恒选第一条"。必须用 `chatfmt.find_span` 定位问题那句话。
 - **连测 7 轮会让笔记本 GPU 从 2160 MHz 掉到 ~870 MHz（94 W → 35 W），同一条件耗时翻倍。** 跨条件对比必须在同一时钟区间内**逐轮交替**取差值中位 —— 否则会算出"注入耗时 −40 ms"这种负数。
+- **"模型忘了"必须实测，别当成前提。** S4 的验收标准写着"第 20 轮取回"，很容易读成"原版模型 20 轮就忘了"；实测 120 轮（3785 token）仍然 8/8，该模型上下文上限是 262144。**验收标准里的"答对"只能证明记忆通路可用，不能证明它比"留在上下文里"更好。**
