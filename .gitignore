@@ -1,0 +1,27 @@
+# 环境与缓存（体积大、与代码无关）
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 模型权重：实体一律放 H:\hf-cache，这里只放软链接
+models/*
+!models/.gitkeep
+
+# 数据：评测集可入库，训练数据与蒸馏产物不入库
+data/*
+!data/eval/
+!data/.gitkeep
+
+# 产物：报告入库，原始输出与权重不入库
+reports/*.jsonl
+reports/*.safetensors
+reports/*.pt
+
+# 本地缓存与临时目录（一律落在项目内，不写 C 盘）
+.hf-cache/
+.pip-cache/
+.tmp/
+
+# 抓取的第三方网页原文（教师选型调研的原始输入，非项目产物）
+reports/web-*.txt
