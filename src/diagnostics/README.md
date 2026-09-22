@@ -62,4 +62,19 @@ $env:TORCHINDUCTOR_CACHE_DIR='H:\Nova\.tmp\inductor-cache'
 **第三轮新增的坑：**
 
 - **微基准证明不了端到端收益。** eager 下 bnb 16.32 vs nf4 16.56 tok/s 几乎一样；**只有图解码（纯 GPU 时间）才暴露 1.79x 的真实差距**（16.0 vs 28.8 ms/token）。单算子尺度上时间被启动开销淹没。
-- **`@triton.jit` 里引用模块级 Python 常量会报 `NameError: Cannot access global variable`** —— 即使标了 `: tl.constexpr` 也不行（实测）。**kernel 内直接用字面量。**
+## 第四轮（2026-09-22 · S4 记忆最小实现，见 [reports/s4-memory-min.md](../../reports/s4-memory-min.md) 与 **D31**）
+
+| 脚本 | 证明什么 | 命令 |
+|------|------|------|
+| `probe_memory.py` | 捕获 / 注入的**逐位一致性**：整段 prompt 抓成记忆再注入，KV cache 与真实 prefill `max\|diff\| = 0.000e+00` | `& .\.venv\Scripts\python.exe src\diagnostics\probe_memory.py` |
+| `probe_memory_keys.py` | **pre-RoPE 裸余弦不可用**：6 条候选记忆的键裸余弦**全部 > 0.8**，几乎不区分内容 | 同上，换文件名 |
+| `probe_memory_addressing.py` | 寻址第一版：为什么必须按**注入后真实位置**旋转 Q/K 再算 `Q·K`（不旋转则 top-1 只有 1/3） | 同上 |
+| `probe_memory_addressing2.py` | **决定性扫描**：6 条 × 8 问 × 12 组配置 → `alone`+按长度归一+不标准化 = **8/8**；`stack` 2/8；标准化 4/8 | 同上 |
+| `probe_memory_addressing3.py` | 查询取哪几个 token：整句取平均 8/8 掉 7/8；**末尾 4 个 token** 才对 | 同上 |
+| `probe_memory_addressing4.py` | **注入位置**：`place="front"`（插最前面）在 20 轮历史下退化到 1/3 且生成崩；`turn` 才对 | 同上 |
+
+**第四轮新增的坑：**
+
+- **同一套检索逻辑写两份必然漂移。** 第一版 `tests/test_memory.py` 自己在测试里手搓了一遍打分，忘了把 `query_span` 截成末尾 4 个 token，命中率立刻从 8/8 掉 7/8。现在检索只写一份（`MemorySession.rank()`），`prefill` 与测试都调它。
+- **取"prompt 最后 4 个 token"拿到的是 `<|im_start|>assistant\n`**（没有内容）→ 寻址退化成"恒选第一条"。必须用 `chatfmt.find_span` 定位问题那句话。
+- **连测 7 轮会让笔记本 GPU 从 2160 MHz 掉到 ~870 MHz（94 W → 35 W），同一条件耗时翻倍。** 跨条件对比必须在同一时钟区间内**逐轮交替**取差值中位 —— 否则会算出"注入耗时 −40 ms"这种负数。

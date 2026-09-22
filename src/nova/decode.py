@@ -82,20 +82,48 @@ class GraphDecoder:
     # ---- eager prefill ----
 
     @torch.inference_mode()
-    def prefill(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """用静态 cache 做一次 eager prefill（长度可变，不进图）。"""
+    def prefill(
+        self,
+        input_ids: torch.Tensor,
+        offset: int | None = None,
+        reset: bool = True,
+        prefix_writer=None,
+    ) -> torch.Tensor:
+        """用静态 cache 做一次 eager prefill（长度可变，不进图）。
+
+        - `offset`：本段文本的起始位置。默认 0（`reset=True`）或 cache 当前长度（`reset=False`，
+          用于"先把历史写进 cache，再插记忆，再写当前轮"这种分段 prefill）。
+        - `prefix_writer(cache)`：复位之后调用，负责把前缀写进 `[offset, offset+m)` 并返回**新的起点**。
+        - 非 0 起点时必须显式给 attention mask —— **不能走 `is_causal` 那条路**
+          （那条路会把 kv 截断到前 n 个槽位，也就是前缀）。
+        """
+        if reset:
+            self.cache.reset()
+        if prefix_writer is not None:
+            offset = int(prefix_writer(self.cache))
+        if offset is None:
+            offset = int(self.cache.pos.item())
+        offset = int(offset)
         n = input_ids.shape[1]
-        if n > self.max_len:
-            raise ValueError(f"prompt 长度 {n} 超过 max_len {self.max_len}")
-        self.cache.reset()
-        out = self.model(
-            input_ids=input_ids, past_key_values=self.cache, cross_mode="off", logits_to_keep=1
-        )
+        if n + offset > self.max_len:
+            raise ValueError(f"prompt 长度 {n} + 起点 {offset} 超过 max_len {self.max_len}")
+        self.cache.pos.fill_(offset)
+        if offset:
+            rows = torch.arange(offset, offset + n, device=self.cache.pos.device)
+            mask = self.mask_table.index_select(0, rows).view(1, 1, n, self.max_len)
+            out = self.model(
+                input_ids=input_ids, past_key_values=self.cache, attention_mask=mask,
+                cross_mode="off", logits_to_keep=1,
+            )
+        else:
+            out = self.model(
+                input_ids=input_ids, past_key_values=self.cache, cross_mode="off", logits_to_keep=1
+            )
         # ⚠️ 必须填**第一个生成 token**，不能填最后一个 prompt token：
-        # prefill 已把整个 prompt 写进 cache（位置 0..n-1），pos 指向 n。
-        # 若填最后一个 prompt token，图的第一步会把它在位置 n 上**再算一遍**。
+        # prefill 已把整个 prompt 写进 cache（位置 offset..offset+n-1），pos 指向 offset+n。
+        # 若填最后一个 prompt token，图的第一步会把它在位置 offset+n 上**再算一遍**。
         self.input_ids.copy_(out[:, -1].argmax(-1).view(self.batch, 1))
-        self.cache.pos.fill_(n)
+        self.cache.pos.fill_(offset + n)
         return out
 
     # ---- 图内的单步 ----

@@ -62,6 +62,14 @@ class LeanAttention(nn.Module):
         self.q_norm = LeanRMSNorm.from_hf(hf_attn.q_norm, norm_impl)
         self.k_norm = LeanRMSNorm.from_hf(hf_attn.k_norm, norm_impl)
 
+        # ---- 记忆写入用的捕获开关（S4，见 src/nova/memory.py）----
+        # `capture_slice` 非 None 时，把该 token 区间的 **RoPE 之前** 的 Q / K / V 存进 `captured`。
+        # 抓 RoPE 之前的值是为了让 K 与位置解耦 —— 注入时按**新位置**重新旋转即可。
+        # Q 用于"取回"时的寻址（注意力打分 = Q·K，见 memory.py）。
+        # ⚠️ 图解码路径必须保持 None：捕获会 clone 张量，不能进 CUDA Graph。
+        self.capture_slice: tuple[int, int] | None = None
+        self.captured: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -75,6 +83,16 @@ class LeanAttention(nn.Module):
         query = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         key = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        if self.capture_slice is not None:
+            s0, s1 = self.capture_slice
+            if not 0 <= s0 < s1 <= key.shape[2]:
+                raise ValueError(f"capture_slice {self.capture_slice} 超出本层序列长度 {key.shape[2]}")
+            self.captured = (
+                query[:, :, s0:s1, :].detach().clone(),
+                key[:, :, s0:s1, :].detach().clone(),
+                value[:, :, s0:s1, :].detach().clone(),
+            )
 
         cos, sin = position_embeddings
         query, key = apply_rotary_pos_emb(query, key, cos, sin)

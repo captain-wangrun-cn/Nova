@@ -127,6 +127,27 @@ def decode(tokenizer: Any, token_ids: Sequence[int], *, skip_special_tokens: boo
     return tokenizer.decode(list(token_ids), skip_special_tokens=skip_special_tokens)
 
 
+def find_span(tokenizer: Any, text: str, needle: str, *, occurrence: int = 1) -> tuple[int, int]:
+    """在 `text` 里找到 `needle`（第 occurrence 次出现），返回对应的 **token 区间** `[start, end)`。
+
+    用于 S4 记忆写入：把"哪句话值得记"映射成 token 下标（见 src/nova/memory.py）。
+    `text` 必须是**喂给 tokenizer 的同一个字符串**（否则 offset 对不上）。
+    边界上被切开的 token 会算进来（宁可多记一个 token，也不要漏）。
+    """
+    enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+    offsets = enc["offset_mapping"]
+    c0 = -1
+    for _ in range(int(occurrence)):
+        c0 = text.find(needle, c0 + 1)
+        if c0 < 0:
+            raise ValueError(f"在文本里找不到第 {occurrence} 处 {needle!r}")
+    c1 = c0 + len(needle)
+    idx = [i for i, (a, b) in enumerate(offsets) if b > c0 and a < c1]
+    if not idx:
+        raise ValueError(f"{needle!r} 没有落到任何 token 上")
+    return idx[0], idx[-1] + 1
+
+
 def render_turns(tokenizer: Any, system: str | None, turns: Sequence[Mapping[str, Any]], **kwargs: Any) -> str:
     return render(tokenizer, build_messages(system, turns), **kwargs)
 
