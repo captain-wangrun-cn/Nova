@@ -70,6 +70,29 @@ def digits(s: str) -> str:
     return re.sub(r"\D", "", s)
 
 
+def make_decoder(nova, kv: str, max_len: int) -> GraphDecoder:
+    """按 `kv` 造解码器；非 fp16 时把 cache 换成 int4 往返版（`QuantRoundTripCache`）。
+
+    ⚠️ 模拟版**不省显存**，它测的是精度与 dequant 开销；显存收益只按公式记账。
+    """
+    dec = GraphDecoder(nova, max_len=max_len)
+    if kv == "fp16":
+        return dec
+    from nova.kvquant import QuantRoundTripCache
+
+    cfg = dec.cfg
+    dec.cache = QuantRoundTripCache(
+        num_slots=dec.text.num_cache_layers,
+        num_kv_heads=cfg.num_key_value_heads,
+        head_dim=cfg.head_dim,
+        max_len=max_len,
+        quant_k=kv != "int4v",
+        quant_v=kv != "int4k",
+        residual=128 if kv == "int4res" else 0,
+    )
+    return dec
+
+
 def build(n_rounds: int):
     """干草堆 + 按深度插入 4 条事实；返回 (msgs, 每条事实在第几轮)。"""
     spots = {int(round(n_rounds * d)): (name, code) for name, code, d in NEEDLES}
@@ -93,70 +116,99 @@ def main() -> None:
     ap.add_argument("--lens", type=int, nargs="+", default=[2048, 4096, 8192, 16384])
     ap.add_argument("--max-len", type=int, default=18432)
     ap.add_argument("--max-new", type=int, default=24)
+    ap.add_argument(
+        "--kv",
+        nargs="+",
+        default=["fp16"],
+        choices=("fp16", "int4", "int4res", "int4k", "int4v"),
+        help="K/V 存储精度，**可给多个**（同一轮里轮着跑，跨时间点的速度不可比）："
+             "fp16 基线；int4=K与V都压；int4res=再加最近 128 位置的 fp16 残留窗；int4k/int4v=只压一个",
+    )
     args = ap.parse_args()
 
     nova, tok = load_bundle(1, "triton")
-    dec = GraphDecoder(nova, max_len=args.max_len)
+    from nova.kvquant import bytes_per_token
+
+    cfg = nova.model.config
+    cost = bytes_per_token(nova.model.num_cache_layers, cfg.num_key_value_heads, cfg.head_dim)
     print(f"模型：Qwen3-VL-4B-Instruct · 单通路 · max_len {args.max_len}")
+    print(f"KV 记账：int4 {cost['int4_kv'] / 1024:.0f} KiB/token vs fp16 {cost['fp16_kv'] / 1024:.0f} KiB/token"
+          f" = {cost['ratio']:.2f}x（模拟版不省显存，测的是精度与 dequant 开销）")
     print(f"干草堆：重复闲聊（每轮带唯一编号）+ 4 条形近事实，埋在不同深度\n")
 
-    print(f"{'长度':>8s} {'实际token':>9s}  追问 4 条：答对 / 挑错 / 没答")
-    for target in args.lens:
-        n_rounds = max(8, int(round(target / 36)))
-        msgs, _at = build(n_rounds)
-        hist_text = render(tok, msgs, add_generation_prompt=False)
-        hist_ids = tok(hist_text, add_special_tokens=False)["input_ids"]
-        if len(hist_ids) + 64 > args.max_len:
-            print(f"{target:>8d}  —— 超过 max_len，跳过（实际 {len(hist_ids)}）")
-            continue
-        hist_t = torch.tensor([hist_ids], device="cuda")
+    scores: dict[tuple[str, int], tuple[int, int, int]] = {}
+    for kv in args.kv:
+        dec = make_decoder(nova, kv, args.max_len)
+        print(f"\n【{kv}】")
+        print(f"{'长度':>8s} {'实际token':>9s}  追问 4 条：答对 / 挑错 / 没答"
+              f"{'':>16s}{'prefill':>9s} {'峰值':>9s} {'clocks.sm':>10s}")
+        for target in args.lens:
+            n_rounds = max(8, int(round(target / 36)))
+            msgs, _at = build(n_rounds)
+            hist_text = render(tok, msgs, add_generation_prompt=False)
+            hist_ids = tok(hist_text, add_special_tokens=False)["input_ids"]
+            if len(hist_ids) + 64 > args.max_len:
+                print(f"{target:>8d}  —— 超过 max_len，跳过（实际 {len(hist_ids)}）")
+                continue
+            hist_t = torch.tensor([hist_ids], device="cuda")
 
-        t0 = time.perf_counter()
-        dec.prefill(hist_t)
-        torch.cuda.synchronize()
-        prefill_s = time.perf_counter() - t0
-        h = len(hist_ids)
-        clk = clock_sm()
+            torch.cuda.reset_peak_memory_stats()
+            t0 = time.perf_counter()
+            dec.prefill(hist_t)
+            torch.cuda.synchronize()
+            prefill_s = time.perf_counter() - t0
+            h = len(hist_ids)
+            clk = clock_sm()
 
-        right = wrong = none = 0
-        detail = []
-        for name, code, _d in NEEDLES:
-            qtext = f"我的{name}密码是多少？只回答那串号码。"
-            full_text = render(tok, msgs + [{"role": "user", "content": qtext}], add_generation_prompt=True)
-            q_ids = tok(full_text, add_special_tokens=False)["input_ids"][h:]
-            q_t = torch.tensor([q_ids], device="cuda")
-            dec.prefill(q_t, offset=h, reset=False)
-            # ⚠️ 这里**不能**用 capture()+step()：capture 每次都会新建一张 CUDA Graph
-            # 并分配新的内存池，而每个问题的起点位置都不同 -> 每个问题都要重捕一次，
-            # 几次之后显存就爆了（实测跑到第 9 次时 7905/8188 MiB 崩溃）。
-            # 只生成 ~20 个 token，直接 eager 调 `_body()` 就够，还省掉整块图内存。
-            out = []
-            for _ in range(args.max_new):
-                t = int(dec.input_ids.item())
-                if t in STOP:
-                    break
-                out.append(t)
-                dec._body()
-            text = tok.decode(out, skip_special_tokens=True).strip().replace("\n", " ")
-            got = digits(text)
-            if digits(code) in got:
-                right += 1
-                detail.append("O")
-            elif any(digits(c) in got for _n, c, _dd in NEEDLES if c != code):
-                wrong += 1
-                detail.append("!")
-                print(f"        ↳ 挑错！问「{name}」（应 {code}）答的是：{text[:50]}")
-            else:
-                none += 1
-                detail.append("X")
-                print(f"        ↳ {name}（应 {code}）没答出：{text[:50]}")
-            dec.cache.pos.fill_(h)  # 回到干草堆末尾，复用这份 prefill
-        peak = torch.cuda.max_memory_allocated() / 1024 ** 3
-        print(f"{target:>8d} {h:>9d}  {right}/4 挑错 {wrong} 没答 {none}   {' '.join(detail)}"
-              f"   [prefill {prefill_s:.1f}s · 峰值 {peak:.2f} GiB · clocks.sm {clk}]")
+            right = wrong = none = 0
+            detail = []
+            for name, code, _d in NEEDLES:
+                qtext = f"我的{name}密码是多少？只回答那串号码。"
+                full_text = render(tok, msgs + [{"role": "user", "content": qtext}], add_generation_prompt=True)
+                q_ids = tok(full_text, add_special_tokens=False)["input_ids"][h:]
+                q_t = torch.tensor([q_ids], device="cuda")
+                dec.prefill(q_t, offset=h, reset=False)
+                # ⚠️ 这里**不能**用 capture()+step()：capture 每次都会新建一张 CUDA Graph
+                # 并分配新的内存池，而每个问题的起点位置都不同 -> 每个问题都要重捕一次，
+                # 几次之后显存就爆了（实测跑到第 9 次时 7905/8188 MiB 崩溃）。
+                # 只生成 ~20 个 token，直接 eager 调 `_body()` 就够，还省掉整块图内存。
+                out = []
+                for _ in range(args.max_new):
+                    t = int(dec.input_ids.item())
+                    if t in STOP:
+                        break
+                    out.append(t)
+                    dec._body()
+                text = tok.decode(out, skip_special_tokens=True).strip().replace("\n", " ")
+                got = digits(text)
+                if digits(code) in got:
+                    right += 1
+                    detail.append("O")
+                elif any(digits(c) in got for _n, c, _dd in NEEDLES if c != code):
+                    wrong += 1
+                    detail.append("!")
+                    print(f"        ↳ 挑错！问「{name}」（应 {code}）答的是：{text[:50]}")
+                else:
+                    none += 1
+                    detail.append("X")
+                    print(f"        ↳ {name}（应 {code}）没答出：{text[:50]}")
+                dec.cache.pos.fill_(h)  # 回到干草堆末尾，复用这份 prefill
+            peak = torch.cuda.max_memory_allocated() / 1024 ** 3
+            scores[(kv, target)] = (right, wrong, none)
+            print(f"{target:>8d} {h:>9d}  {right}/4 挑错 {wrong} 没答 {none}   {' '.join(detail):<18s}"
+                  f" [prefill {prefill_s:>6.1f}s · 峰值 {peak:>5.2f} GiB · clocks.sm {clk}]")
+        del dec
+        torch.cuda.empty_cache()
 
     print("\nO=答对  !=挑成别的密码（最危险）  X=没答出")
     print("注：4 条事实格式完全相同，只有地点与号码不同。")
+    if len(args.kv) > 1 and all((("fp16", t) in scores) for t in args.lens):
+        print("\n与 fp16 基线对比（同一轮，可横向比）：")
+        for kv in args.kv:
+            if kv == "fp16":
+                continue
+            drops = [f"{t}:{scores[(kv, t)][0] - scores[('fp16', t)][0]:+d}" for t in args.lens]
+            print(f"    {kv:>7s} 答对数变化 {' '.join(drops)}")
 
 
 if __name__ == "__main__":
