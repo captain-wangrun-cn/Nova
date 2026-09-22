@@ -80,3 +80,21 @@ $env:TORCHINDUCTOR_CACHE_DIR='H:\Nova\.tmp\inductor-cache'
 - **取"prompt 最后 4 个 token"拿到的是 `<|im_start|>assistant\n`**（没有内容）→ 寻址退化成"恒选第一条"。必须用 `chatfmt.find_span` 定位问题那句话。
 - **连测 7 轮会让笔记本 GPU 从 2160 MHz 掉到 ~870 MHz（94 W → 35 W），同一条件耗时翻倍。** 跨条件对比必须在同一时钟区间内**逐轮交替**取差值中位 —— 否则会算出"注入耗时 −40 ms"这种负数。
 - **"模型忘了"必须实测，别当成前提。** S4 的验收标准写着"第 20 轮取回"，很容易读成"原版模型 20 轮就忘了"；实测 120 轮（3785 token）仍然 8/8，该模型上下文上限是 262144。**验收标准里的"答对"只能证明记忆通路可用，不能证明它比"留在上下文里"更好。**
+
+## 第五轮（2026-09-22 · 长上下文注意力，见 [reports/long-context-attention.md](../../reports/long-context-attention.md) 与 **D33**）
+
+| 脚本 | 证明什么 | 命令 |
+|------|------|------|
+| `probe_long_context_vram.py` | **瓶颈归因**：SDPA 后端真实状态（flash 未编译 / 融合内核要求头数相同）、峰值随长度的增长曲线（扣掉固定占用后翻倍涨 ~4x = O(n^2)）、固定占用拆解 | `& .\.venv\Scripts\python.exe src\diagnostics\probe_long_context_vram.py` |
+| `probe_attention_kernel.py` | **决定性**：同轮内对比 GQA 留 SDPA（math 回退）/ 展平 32 头 / 强制 cuDNN —— 1749 token **2.1x**、3012 **2.5x**、7146 现状 OOM 而展平只要 3.53 GiB | 同上，换文件名 |
+| `probe_kernel_mapping.py` | **数值正确性（改注意力路径必过）**：两边钉 math 时逐位一致（0.000e+00）→ `repeat_kv` 的 GQA 映射正确；与手写 fp32 参考误差相同（4.07e-04） | 同上 |
+| `probe_attention_tradeoff.py` | 后端可用性（MATH 6.76 GiB / 5293 ms vs EFFICIENT **3.26 GiB / 1299 ms**）+ **贪心 32/32 token 一致** | 同上 |
+| `probe_kernel_equivalence.py` | 展平后的**长度天花板**：7146 / 14363 健康，21615 峰值 8.50 GiB + prefill **375.9 s**（换页断崖） | 同上 |
+| `exp_needle.py` | **信息过载下的选择性**：4 条同形事实（只有地点与号码不同）埋在不同深度、各问一次 -> 1894/3665/7291/**12728** token 全部 **4/4、零挑错** | `... exp_needle.py --lens 2048 4096 8192 14363 --max-len 14848` |
+
+**第五轮新增的坑：**
+
+- **`GraphDecoder.capture()` 每次都新建一张 CUDA Graph 并分配新内存池。** 若每个问题都重捕（起点位置不同），几次之后显存就爆 —— 实测重捕 9 次后 7905/8188 MiB 崩溃。只生成几十个 token 时直接调 `dec._body()`（eager），别建图。
+- **GQA + `enable_gqa=True` 在本机会静默退回 math 后端**，实体化 O(n^2) 的 **fp32** 分数矩阵（`32 头 x n^2 x 4 字节 x 2 张`）。它不报错，只让显存与耗时突然涨一个量级 —— **看到长 prefill 峰值异常，先查 SDPA 走了哪个后端**（`torch.backends.cuda.is_flash_attention_available()`）。
+- **改注意力路径必须先过"两边钉同一个后端"的等价性测试。** 直接比 logits 会被内核精度差异误导（`max|diff| ~ 1.0` 看着像 bug，其实是 fp16 累加）；钉住后端后是 0.000e+00。
+- **别用跨时间点的数字算加速比。** 3665 token 从 29.1 s 变 1.4 s 是"不再换页"的功劳，不是内核快 20 倍；同轮内的数字才可比。

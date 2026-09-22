@@ -10,12 +10,12 @@
 | 项 | 状态 |
 |------|------|
 | 设计文档 | ✅ **16 份，3359 行**（`docs/01` ~ `docs/16`） |
-| 决策 | ✅ **31 条**（`docs/13-decisions.md`）；D19 待定，D21/D22 已被 D23/D24 取代，**D26 技术归因已被 D27 更正**，**D30 取代 D29 第 2 条的路径排序**；新增 D28（S3 完成）、D29（CUDA Graph 解码）、D30（速度路径 ① 结案 + lm_head 4-bit）、**D31（S4 记忆最小实现）** |
+| 决策 | ✅ **33 条**（`docs/13-decisions.md`）；D19 待定，D21/D22 已被 D23/D24 取代，**D26 技术归因已被 D27 更正**，**D30 取代 D29 第 2 条的路径排序**，**D32 更正 D31 的解读**，**D33 补充 D28 的成立条件**；新增 D31（S4 记忆最小实现）、D32（S4 对照实验）、**D33（长上下文注意力）** |
 | 教师选型 | ✅ **已冻结（v4 七层，D24）**，S5 直接执行，不要重新调研 |
 | 代码 | ✅ **S0-S4 全部完成 + 速度路径 ①/②**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码 + 4-bit lm_head + **L0 记忆 `memory.py`**）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、**`src/s4_memory_demo.py`**、`tests/`（**40 passed**）、`src/bench_nova.py`、`src/bench_graph.py`、**`src/bench_memory.py`**、`src/diagnostics/`（速度归因 + 记忆诊断脚本） |
 | 环境 | ✅ torch 2.6.0+cu124 + 权重 **8.89 GB 已缓存**（`.hf-cache`）；基线 4-bit 峰值 **2.79 GiB**；**Nova 单通路图解码 14.0 ms/token（71.3 tok/s，3.28 GiB）/ 双通路 22.7 ms/token（44.0 tok/s，4.83 GiB）** |
 | 代码托管 | ✅ **<https://github.com/captain-wangrun-cn/Nova>**（**public**，默认分支 `main`）。提交规范见 [AGENTS.md](AGENTS.md) 第七节 |
-| 下一步 | **S5 · 数据与蒸馏**（里程碑 2 起点）；速度侧 **③ 融合 RoPE / 去冗余拷贝 → ④ 融合注意力**；记忆侧见第七节"下一步优化" |
+| 下一步 | **KV int4 量化**（唯一不碰训练就能拿到的 ~4x，目标 ~50K 上下文，见第六·补二节）；然后 **S5 · 数据与蒸馏**（里程碑 2 起点）；速度侧 **③ 融合 RoPE / 去冗余拷贝**；记忆侧见第七节"下一步优化" |
 
 **一句话：设计做完了，现在要开始证明"双通路 + 内部记忆"在 8GB 显存上真的能跑。**
 
@@ -219,6 +219,34 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 
 ---
 
+## 六·补二 · 长上下文注意力（✅ 2026-09-22 —— **一个开关换来 4 倍长度**）
+
+**报告：[reports/long-context-attention.md](reports/long-context-attention.md) · 决策 D33**
+
+起因是用户提的"让 4060 8GB 跑满 260K 上下文，再测信息过载时能不能注意到重点"。开工前先量天花板，结果**瓶颈不在原先设想的地方**。
+
+**已核查（诊断脚本 `probe_long_context_vram.py` / `probe_attention_kernel.py` / `probe_kernel_mapping.py` / `probe_attention_tradeoff.py` / `exp_needle.py`）：**
+
+1. **瓶颈是注意力后端，不是 KV cache。** 本机 torch 2.6.0+cu124 **没编译 flash attention**，而 mem-efficient / cuDNN 两个融合内核**都要求 Q/K/V 头数相同**；GQA（32 Q / 8 KV）+ `enable_gqa=True` → SDPA **退回 math 后端 → 实体化 O(n²) 的 fp32 分数矩阵**。3665 token 的 prefill 峰值 **8.80 GiB**（超过物理 8188 MiB，换页，29.1 s），7291 token 直接 OOM —— 而按 KV cache 算只该占 1.41 GiB。
+2. **改一行就解决**：`gqa_in_sdpa = False`（进 SDPA 前先 `repeat_kv` 展平成 32 头）。**同轮内**对比：1749 token **2.1x**、3012 token **2.5x**、4096 token **4.1x**（6.76 → 3.26 GiB）。长度 ×4（1749 → 7146）峰值只从 3.15 涨到 3.53 GiB。
+3. **数值正确性已过**：两边钉 math 后端时 `repeat_kv` 与 `enable_gqa` **逐位一致（0.000e+00）**；vs 手写 fp32 参考误差相同（4.07e-04）；**贪心 32/32 token 一致**。
+4. **新天花板 ~14–15K token**（单通路 fp16 KV）。14363 健康（6.47 GiB / 9.36 s）；21615 峰值 8.50 GiB、prefill **375.9 s**（换页断崖）。
+5. **信息过载下的选择性没有退化**：4 条**同形干扰事实**（格式相同，只有地点与号码不同）埋在不同深度、各问一次 → **1894 / 3665 / 7291 / 12728 token 全部 4/4 答对，零挑错**，峰值 6.67 GiB，prefill 6.8 s（clocks.sm 2340–2460 MHz）。
+
+**`pytest tests -q` → 41 passed**（新增 `test_fused_attention_agrees_on_tokens`），总耗时 69 s → 53 s。
+
+**新会话必读的三条：**
+
+1. **`test_gating_off_matches_baseline` 两边钉在 `sdpa_kernel(MATH)`。** 它测的是**架构与权重保真度**，不该受"恰好 dispatch 到哪个内核"影响。**D28 的"逐位一致"今后必须注明是在 math 后端下** —— 展平后与 HF 不再逐位相同（原始 logits 有 fp16 累加级差异，`max|diff| ≈ 1.0` / 量级 112）。
+2. **不要用跨时间点的数字算加速比。** needle 那次 3665 token 从 29.1 s 变 1.4 s，主因是**不再溢出到系统内存**，不是内核快了 20 倍。纯内核加速只看同轮的 2.1x / 2.5x / 4.1x。
+3. **`GraphDecoder.capture()` 每次都会新建一张 CUDA Graph 并分配新内存池。** 每个问题都重捕（起点位置不同）会让显存爆掉 —— 实测重捕 9 次后 7905/8188 MiB 崩溃。只生成几十个 token 时直接用 `dec._body()`（eager）。
+
+**离 262144 还有多远（算术推算）：** 262144 × 144 KiB = **36.0 GiB**，而 D17 预算内只剩约 **3.8 GiB** → 需 **~9.5x** KV 压缩。杠杆：**int4 KV（4x，不需训练）** → 跨层 KV 共享（2–4x，要训练）→ MLA（~4x+，要训练）；组合 ~16x 可摸到 224K。另加**算力墙**：注意力 O(n²)，12728 token 实测 6.8 s → 262144 token 约 **47 分钟/次全量 prefill**（增量轮次不受影响，仍 ~30 ms/token）。
+
+**下一步（排序）：** ① **KV int4 量化**（唯一不碰训练就能拿到的 4x，目标 ~50K）→ ② 用 needle 逐档量 int4 的精度衰减 → ③ 跨层 KV 共享（里程碑 2）→ ④ 干扰项数量扫描（4 → 16 → 64 条同形事实）找退化拐点。
+
+---
+
 ## 七、S4 · 记忆最小实现（✅ 已完成 2026-09-22 —— **8/8 取回，跨进程可复现**）
 
 **报告：[reports/s4-memory-min.md](reports/s4-memory-min.md) · 决策 D31 · 演示 `src/s4_memory_demo.py` · 基准 `src/bench_memory.py`**
@@ -293,7 +321,7 @@ $env:HF_HUB_OFFLINE='1'; $env:TRITON_CACHE_DIR=$env:TMP+'\triton-cache'; $env:TO
 | `docs/01` ~ `docs/16` | 设计文档（15 愿景 / 02 架构 / 03 记忆 / 11 路线图 / 13 决策 / 15 语言 / 16 模型解剖） |
 | `src/` | 代码（S0-S4 全部完成；`nova/` 是双通路骨架 + 图解码 + **L0 记忆**，`chat.py` 交互 CLI，`diagnostics/` 是速度归因 + 记忆诊断脚本） |
 | `tests/` | 单元测试（**40 passed**：`test_nova_skeleton.py` 8 条 + `test_graph_decode.py` 4 条 + `test_nf4_linear.py` 11 条 + `test_lm_head4.py` 5 条 + **`test_memory.py` 12 条**） |
-| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / `speed-path1-nf4-gemv` / **`s4-memory-min`**） |
+| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / `speed-path1-nf4-gemv` / `s4-memory-min` / **`long-context-attention`**） |
 | `data/` | 评测集、训练数据（待建，**放 H 盘更大的话用软链接**） |
 | `models/` | 本地权重（建议只放软链接，实体在 `H:\hf-cache`） |
 
