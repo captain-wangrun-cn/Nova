@@ -53,7 +53,23 @@ class LeanAttention(nn.Module):
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = config.head_dim ** -0.5
         self.is_causal = True
-        self.gqa_in_sdpa = True
+        # ⚠️ **默认 False（先 repeat_kv 展平成 32 头再进 SDPA）。这是实测逼出来的，不是随手写的。**
+        #
+        # 本机 torch 2.6.0+cu124 **没有编译 flash attention**，而 mem-efficient / cuDNN 两个融合内核
+        # 都要求 Q/K/V 头数相同。GQA（32 Q / 8 KV）加上 `enable_gqa=True` 会让 SDPA **退回 math 后端**，
+        # 实体化 O(n²) 的 **fp32** 分数矩阵：
+        #
+        # | 4096 token 前向 | 峰值显存 | 耗时 |
+        # |------|:---:|:---:|
+        # | `enable_gqa=True`（math 回退） | 6.76 GiB | 5293 ms |
+        # | `False`（展平 → EFFICIENT_ATTENTION） | **3.26 GiB** | **1299 ms** |
+        #
+        # 展平后长度翻 4 倍（1749 → 7146）显存只从 3.15 涨到 3.53 GiB；不展平时 7146 token 直接 OOM。
+        # 代价是**与 HF 的逐位一致没有了**（32/32 个贪心 token 仍然相同，见
+        # `test_fused_attention_agrees_on_tokens`）；架构保真度由 `sdpa_kernel(MATH)` 下的
+        # 逐位一致测试单独保证。
+        # 证据：`reports/long-context-attention.md`、`src/diagnostics/probe_attention_kernel.py`。
+        self.gqa_in_sdpa = False
 
         self.q_proj = hf_attn.q_proj
         self.k_proj = hf_attn.k_proj

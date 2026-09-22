@@ -5,7 +5,8 @@
 | 测试 | 判据 |
 |------|------|
 | `test_forward_shapes` | 前向 shape 正确 |
-| `test_gating_off_matches_baseline` | **门控关闭时 ≈ 基线**（最重要） |
+| `test_gating_off_matches_baseline` | **门控关闭时 ≈ 基线**（最重要；两边都钉在 math 后端，测的是架构保真度） |
+| `test_fused_attention_agrees_on_tokens` | 展平 KV 走融合内核时，贪心 token 与 math 路径一致 |
 | `test_cross_isolation` | 交叉注意力隔离：切断一条通路不影响另一条 |
 | `test_generate_20_tokens` | 生成 20 token 不崩 |
 | `test_memory_budget` | 显存 < 7GB（D17） |
@@ -49,17 +50,23 @@ def test_gating_off_matches_baseline(bundle, prompt_ids):
 
     prefill 与 decode 都要测：只测 prefill 会漏掉位置编码 / KV cache 槽位类的错误
     （开发过程中确实漏过一次 —— 见 [reports/s3-dual-path-skeleton.md](../reports/s3-dual-path-skeleton.md)）。
+
+    ⚠️ **两边都钉在 math 后端**（`sdpa_kernel(MATH)`）。这条测的是**架构与权重的保真度**，
+    不该受"SDPA 恰好 dispatch 到哪个内核"影响：本机没有 flash，GQA 会让 SDPA 退回 math，
+    而 Nova 现在默认先展平 KV 走融合内核（见 [reports/long-context-attention.md](../reports/long-context-attention.md)）。
+    不钉后端的话，这条会因为内核不同而假失败 —— 那是内核差异，不是实现错误。
     """
     nova, hf, _ = bundle
+    from torch.nn.attention import SDPBackend, sdpa_kernel
 
-    with torch.inference_mode():
+    with torch.inference_mode(), sdpa_kernel(SDPBackend.MATH):
         base = hf(input_ids=prompt_ids, use_cache=False).logits
         got = nova(input_ids=prompt_ids, cross_mode="off")
     assert torch.equal(base, got), f"prefill 不一致，max|diff|={(base.float()-got.float()).abs().max().item():.3e}"
 
     cache_a, cache_b = DynamicCache(), DynamicCache()
     cur = prompt_ids
-    with torch.inference_mode():
+    with torch.inference_mode(), sdpa_kernel(SDPBackend.MATH):
         for step in range(8):
             la = hf(input_ids=cur, past_key_values=cache_a, use_cache=True).logits[:, -1]
             lb = nova(input_ids=cur, past_key_values=cache_b, cross_mode="off")[:, -1]
@@ -67,6 +74,37 @@ def test_gating_off_matches_baseline(bundle, prompt_ids):
                 f"decode 第 {step} 步不一致，max|diff|={(la.float()-lb.float()).abs().max().item():.3e}"
             )
             cur = la.argmax(dim=-1, keepdim=True)
+
+
+def test_fused_attention_agrees_on_tokens(bundle, prompt_ids):
+    """展平 KV（走融合内核）与 math 路径的 **token 级**一致率。
+
+    两条路都正确（对手写 fp32 参考的相对误差相同，4.07e-04），原始 logits 会有 fp16 累加级差异，
+    所以判据是**贪心 token 一致**，不是逐位 —— 与 lm_head 4-bit 当年同一标准（24/24、32/32）。
+    实测 32/32。
+
+    这里**不钉后端**：`False` 展平后 SDPA 自己会挑融合内核，`True` 则因为 GQA 头数不等而回退 math,
+    两者正是要对比的两条真实路径。
+    """
+    nova, _, _ = bundle
+
+    attns = [
+        layer.self_attn
+        for group in (list(nova.model.prefix_layers), *nova.model.path_layers, list(nova.model.suffix_layers))
+        for layer in group
+    ]
+    outs = {}
+    for flag in (False, True):  # False = 展平（默认，融合内核）；True = GQA 留 SDPA（回退 math）
+        for attn in attns:
+            attn.gqa_in_sdpa = flag
+        with torch.inference_mode():
+            outs[flag] = greedy_generate(nova, prompt_ids, max_new_tokens=16, cross_mode="off")
+    for attn in attns:  # 复原默认
+        attn.gqa_in_sdpa = False
+    got, want = outs[False].tolist(), outs[True].tolist()
+    n = min(len(got), len(want))
+    same = sum(1 for a, b in zip(got[:n], want[:n]) if a == b)
+    assert same == n, f"展平 KV 后 token 不一致：{same}/{n}"
 
 
 def test_cross_isolation(bundle, prompt_ids):
