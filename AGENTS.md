@@ -86,6 +86,11 @@ $l = (($body.TrimEnd("`r","`n") -split "`r?`n") | ForEach-Object {"+"+$_}) -join
 
 ## 七、Git 提交规范
 
+**仓库：** <https://github.com/captain-wangrun-cn/Nova>（**public**，默认分支 `main`，远端名 `origin`）。
+
+> 沙箱环境下 `git` 可能报 `dubious ownership`；用 `git -c safe.directory=H:/Nova ...`。
+> 写 `.git` 需要提权（沙箱里 `.git` 只给读权限）。
+
 **格式：**
 
 ```

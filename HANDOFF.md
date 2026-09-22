@@ -14,6 +14,7 @@
 | 教师选型 | ✅ **已冻结（v4 七层，D24）**，S5 直接执行，不要重新调研 |
 | 代码 | ✅ **S0 / S1 / S2 / S3 已完成**：`src/chatfmt.py`、`src/tokenizer_probe.py`、`src/baseline.py`、**`src/nova/`（双通路骨架 + 静态 KV cache + CUDA Graph 解码）**、`tests/`、`src/bench_nova.py`、`src/bench_graph.py` |
 | 环境 | ✅ torch 2.6.0+cu124 + 权重 **8.89 GB 已缓存**（`.hf-cache`）；基线 4-bit 峰值 **2.79 GiB**；**Nova 单通路图解码 14.0 ms/token（71.3 tok/s，3.28 GiB）/ 双通路 22.7 ms/token（44.0 tok/s，4.83 GiB）** |
+| 代码托管 | ✅ **<https://github.com/captain-wangrun-cn/Nova>**（**public**，默认分支 `main`）。提交规范见 [AGENTS.md](AGENTS.md) 第七节 |
 | 下一步 | **S4 · 记忆最小实现**（速度路径 ② 已落地；③/④ 并行推进，不互相阻塞） |
 
 **一句话：设计做完了，现在要开始证明"双通路 + 内部记忆"在 8GB 显存上真的能跑。**
