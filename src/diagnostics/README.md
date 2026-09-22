@@ -1,4 +1,4 @@
-# src/diagnostics · 速度归因复现脚本
+# src/diagnostics · 诊断复现脚本（速度 / 记忆 / 注意力 / KV 量化）
 
 > 产生于 **2026-09-22**，用于推翻 [reports/s2-speed-diagnosis.md](../../reports/s2-speed-diagnosis.md) 第一~五节的归因。
 > 结论见该报告**第八节**与 **D27**。原始数字见 [reports/s2-speed-evidence-2026-09-22.json](../../reports/s2-speed-evidence-2026-09-22.json)。
@@ -90,7 +90,7 @@ $env:TORCHINDUCTOR_CACHE_DIR='H:\Nova\.tmp\inductor-cache'
 | `probe_kernel_mapping.py` | **数值正确性（改注意力路径必过）**：两边钉 math 时逐位一致（0.000e+00）→ `repeat_kv` 的 GQA 映射正确；与手写 fp32 参考误差相同（4.07e-04） | 同上 |
 | `probe_attention_tradeoff.py` | 后端可用性（MATH 6.76 GiB / 5293 ms vs EFFICIENT **3.26 GiB / 1299 ms**）+ **贪心 32/32 token 一致** | 同上 |
 | `probe_kernel_equivalence.py` | 展平后的**长度天花板**：7146 / 14363 健康，21615 峰值 8.50 GiB + prefill **375.9 s**（换页断崖） | 同上 |
-| `exp_needle.py` | **信息过载下的选择性**：4 条同形事实（只有地点与号码不同）埋在不同深度、各问一次 -> 1894/3665/7291/**12728** token 全部 **4/4、零挑错** | `... exp_needle.py --lens 2048 4096 8192 14363 --max-len 14848` |
+| `exp_needle.py` | **信息过载下的选择性**：4 条同形事实（只有地点与号码不同）埋在不同深度、各问一次 -> 1894/3665/7291/**12728** token 全部 **4/4、零挑错**。`--kv` 可给**多个**（`fp16 int4 int4res int4k int4v`），在同一进程同一轮里轮着跑 —— 跨时间点的速度不可比，见 AGENTS.md 第七节第 4 条 | `... exp_needle.py --lens 2048 4096 8192 14363 --max-len 14848 --kv fp16 int4` |
 
 **第五轮新增的坑：**
 
@@ -98,3 +98,20 @@ $env:TORCHINDUCTOR_CACHE_DIR='H:\Nova\.tmp\inductor-cache'
 - **GQA + `enable_gqa=True` 在本机会静默退回 math 后端**，实体化 O(n^2) 的 **fp32** 分数矩阵（`32 头 x n^2 x 4 字节 x 2 张`）。它不报错，只让显存与耗时突然涨一个量级 —— **看到长 prefill 峰值异常，先查 SDPA 走了哪个后端**（`torch.backends.cuda.is_flash_attention_available()`）。
 - **改注意力路径必须先过"两边钉同一个后端"的等价性测试。** 直接比 logits 会被内核精度差异误导（`max|diff| ~ 1.0` 看着像 bug，其实是 fp16 累加）；钉住后端后是 0.000e+00。
 - **别用跨时间点的数字算加速比。** 3665 token 从 29.1 s 变 1.4 s 是"不再换页"的功劳，不是内核快 20 倍；同轮内的数字才可比。
+
+## 第六轮（2026-09-22 · KV int4 量化，见 [reports/kv-int4.md](../../reports/kv-int4.md) 与 **D34**）
+
+| 脚本 | 证明什么 | 命令 |
+|------|------|------|
+| `probe_kvquant_wiring.py` | **接线**：把「模型实际读到的 K/V」（`update()` 返回值，**在 update 内当场比**）与「真正写进 cache 的 K/V」逐层对照。`copy` 模式（只拷贝不量化）**必须与 fp16 逐位一致** —— 这是整条通路的恒等判据 | `& .\.venv\Scripts\python.exe -u src\diagnostics\probe_kvquant_wiring.py` |
+| `probe_kvquant_real.py` | **[A]** 短上下文分水岭（15 token 就崩 = bug，不是精度）· **[B]** 真实 K/V 的往返误差 / 通道离群度（第 0 层 K **65x**）· **[C]** 开销拆分（prefill / decode 分测，同轮交替取小值） | `... probe_kvquant_real.py --len 4096 --kinds fp16 int4 int4k int4v --reps 6` |
+| `exp_needle.py --kv` | **端到端**：`fp16` / `int4` / `int4res` / `int4k` / `int4v` 逐档对比答对与挑错 | `... exp_needle.py --kv fp16 int4 int4res --lens 2048 4096 8192` |
+
+**第六轮新增的坑：**
+
+- **"压缩掉分"必须先排除接线 bug。** `--kv int4` 一开始 0/4 且输出胡言乱语，看着像"4-bit 精度不行"；真因是 `QuantRoundTripCache.update` 把已写入范围写成 `pos + 1`，而**多 token 时 `StaticKVCache.update` 内部转调 `append_prefill` 且 `pos` 不推进** → prefill 只有第 0 个位置进了工作区，1..n-1 全是工作区的 0。正确写法 `used = start + n`。
+- **设计一个"本该恒等"的对照组，比任何指标都快定位 bug。** 本次的决定性线索：`residual=128` 在 15 token 上 `keep = used - 128 = 0`，**一个位置都不该被量化**，本该与 fp16 完全一致 —— 却也不一致。同理 `copy` 模式（`residual` 取 1<<30）必须与 fp16 **逐位**一致（实测 logits 差 0.0000）。
+- **仪器自己的显存开销会伪装成"算法慢"。** 第一版工作区**按层各留一块**（36 × 2 × 37.7 MB ≈ 2.7 GB），峰值顶到 **11.8 GiB** → Windows 换页 → prefill 从 1.2 s 变 19.6 s。改成 **36 层共用一块**（75.5 MiB）后峰值回到 6.8 GiB。**层是串行的，本来就只需要一块。**
+- **朴素"先还原再算"的开销随 `max_len` 而不是 `used` 涨。** 同一个 n=3665：`max_len=3697` 时 prefill 1.0x / decode 2.0x；`max_len=18432` 时 prefill 1.5x / decode 5.0x；进了 needle 那套环境（`max_len=18432` + 每题 4 个 needle）prefill 变 **25x**。归因**推测**为换页 + 分配器 churn（未分离）；`--max-len` 就是为钉这一条加的。
+- **量化器要先在合成张量上单独证对**（`tests/test_kvquant.py`，13 条，CPU 可跑）。否则"是 bug 还是精度"永远分不清 —— 这次就是先过了它才敢断定 0/4 是接线问题。
+- **反量化用的是存下来的 fp16 尺子**（`min`/`step` 各 fp16），与 fp32 原尺子差 ≤ 1% 个 `step`。测试里显式钉了这个上界，别让它悄悄变成"未知差异"。

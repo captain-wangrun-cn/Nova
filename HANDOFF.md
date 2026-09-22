@@ -10,12 +10,12 @@
 | 项 | 状态 |
 |------|------|
 | 设计文档 | ✅ **16 份，3359 行**（`docs/01` ~ `docs/16`） |
-| 决策 | ✅ **33 条**（`docs/13-decisions.md`）；D19 待定，D21/D22 已被 D23/D24 取代，**D26 技术归因已被 D27 更正**，**D30 取代 D29 第 2 条的路径排序**，**D32 更正 D31 的解读**，**D33 补充 D28 的成立条件**；新增 D31（S4 记忆最小实现）、D32（S4 对照实验）、**D33（长上下文注意力）** |
+| 决策 | ✅ **34 条**（`docs/13-decisions.md`）；D19 待定，D21/D22 已被 D23/D24 取代，**D26 技术归因已被 D27 更正**，**D30 取代 D29 第 2 条的路径排序**，**D32 更正 D31 的解读**，**D33 补充 D28 的成立条件**；新增 D31（S4 记忆最小实现）、D32（S4 对照实验）、D33（长上下文注意力）、**D34（KV int4 量化：精度无退化，但 3.46x 收益未到手）** |
 | 教师选型 | ✅ **已冻结（v4 七层，D24）**，S5 直接执行，不要重新调研 |
-| 代码 | ✅ **S0-S4 全部完成 + 速度路径 ①/②**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码 + 4-bit lm_head + **L0 记忆 `memory.py`**）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、**`src/s4_memory_demo.py`**、`tests/`（**40 passed**）、`src/bench_nova.py`、`src/bench_graph.py`、**`src/bench_memory.py`**、`src/diagnostics/`（速度归因 + 记忆诊断脚本） |
+| 代码 | ✅ **S0-S4 全部完成 + 速度路径 ①/② + KV int4 测量**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码 + 4-bit lm_head + L0 记忆 `memory.py` + **KV 量化 `kvquant.py`**）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、**`src/s4_memory_demo.py`**、`tests/`（**54 passed**）、`src/bench_nova.py`、`src/bench_graph.py`、`src/bench_memory.py`、`src/diagnostics/`（速度归因 + 记忆诊断 + KV 量化诊断脚本） |
 | 环境 | ✅ torch 2.6.0+cu124 + 权重 **8.89 GB 已缓存**（`.hf-cache`）；基线 4-bit 峰值 **2.79 GiB**；**Nova 单通路图解码 14.0 ms/token（71.3 tok/s，3.28 GiB）/ 双通路 22.7 ms/token（44.0 tok/s，4.83 GiB）** |
 | 代码托管 | ✅ **<https://github.com/captain-wangrun-cn/Nova>**（**public**，默认分支 `main`）。提交规范见 [AGENTS.md](AGENTS.md) 第七节 |
-| 下一步 | **KV int4 量化**（唯一不碰训练就能拿到的 ~4x，目标 ~50K 上下文，见第六·补二节）；然后 **S5 · 数据与蒸馏**（里程碑 2 起点）；速度侧 **③ 融合 RoPE / 去冗余拷贝**；记忆侧见第七节"下一步优化" |
+| 下一步 | **KV int4 的细尺子 + 8 位对照 + K 分组方向对照**（见第六·补三节；**先别写融合核**）；然后 **S5 · 数据与蒸馏**（里程碑 2 起点）；速度侧 **③ 融合 RoPE / 去冗余拷贝**；记忆侧见第七节"下一步优化" |
 
 **一句话：设计做完了，现在要开始证明"双通路 + 内部记忆"在 8GB 显存上真的能跑。**
 
@@ -243,7 +243,30 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 
 **离 262144 还有多远（算术推算）：** 262144 × 144 KiB = **36.0 GiB**，而 D17 预算内只剩约 **3.8 GiB** → 需 **~9.5x** KV 压缩。杠杆：**int4 KV（4x，不需训练）** → 跨层 KV 共享（2–4x，要训练）→ MLA（~4x+，要训练）；组合 ~16x 可摸到 224K。另加**算力墙**：注意力 O(n²)，12728 token 实测 6.8 s → 262144 token 约 **47 分钟/次全量 prefill**（增量轮次不受影响，仍 ~30 ms/token）。
 
-**下一步（排序）：** ① **KV int4 量化**（唯一不碰训练就能拿到的 4x，目标 ~50K）→ ② 用 needle 逐档量 int4 的精度衰减 → ③ 跨层 KV 共享（里程碑 2）→ ④ 干扰项数量扫描（4 → 16 → 64 条同形事实）找退化拐点。
+**下一步（排序）：** ① ~~KV int4 量化~~ → ✅ **已完成，见六·补三** ② ~~用 needle 逐档量 int4 的精度衰减~~ → ✅ **已完成（12.7K 内零退化）** → ③ 跨层 KV 共享（里程碑 2）→ ④ 干扰项数量扫描（4 → 16 → 64 条同形事实）找退化拐点（**已提到最前，见六·补三**）。
+
+---
+
+## 六·补三 · KV int4 量化（✅ 2026-09-22 —— **精度没掉，但收益也一分没拿到**）
+
+**报告：[reports/kv-int4.md](reports/kv-int4.md) · 决策 D34 · 代码 `src/nova/kvquant.py` · 测试 `tests/test_kvquant.py`（13 passed，全套 54 passed）**
+
+**已核查：**
+
+1. **记账 3.46x**：fp16 **144 KiB/token** → int4 **41.6 KiB/token**（K 按 `head_dim` 每 32 通道一组、V 按整条 128 一组；`min`/`step` 各 fp16，元数据只占 13.5%）。
+2. **`--kv int4` 一开始 0/4 是接线 bug，不是精度损失。** 根因：`QuantRoundTripCache.update` 把已写入范围写成 `pos + 1`，而多 token 时 `StaticKVCache.update` 内部转调 `append_prefill` 且 `pos` 不推进 → prefill 时只有第 0 个位置被拷进工作区。**决定性线索是"本该恒等却不等"的对照组**（`residual=128` 在 15 token 上 `keep == 0`）。两条回归测试已入库。
+3. **端到端 needle 逐档零退化**：**1894 / 3665 / 7291 / 12728 token 全部 4/4、零挑错**，与 fp16 基线逐档相同（含贴着 D33 天花板的 12728）。
+4. **但误差真实存在**：K 相对 L2 误差最坏 **11.8%**；**第 0 层 K 通道离群 65x**（中间层 4.3–7.2x），该层噪声达通道激活的 **55%**。**"int4 无损"是错的，只是 4 道题的尺子测不出来。**
+5. **开销**：朴素"先还原再算"同轮实测 **prefill 1.0–1.5x / decode 2.0–5.0x**；在 `max_len=18432`（贴近 8GB 上限）的 needle 环境里 prefill 涨到 **8.4x → 25.8x**（现象已核查，**归因标 `推测`**）。
+6. **模拟版不省显存**：SDPA 必须吃 fp16 → 必须有整段 fp16 工作区。收益只按公式记账，**一分未到手**。
+
+**新会话必读的三条：**
+
+1. **别把"记账收益"当成"已实现收益"。** 目前 `src/nova/kvquant.py` 是一个**测量仪**，不是省显存的实现。真省只有融合核 / 分块 dequant + 在线 softmax 两条路，都没做。
+2. **先别写融合核。** 顺序是：**①细尺子**（4→16→64 条干扰事实）→ **②试 8 位**（1.9x 但误差减半、torch 有现成路径，**性价比可能高于 int4**）→ **③K 分组方向对照**（改成按 **token 维**分组，每通道一条跨 token 的尺子；第 0 层 65x 离群说明现在这套在首层很吃亏）。否则会把一套可能要推倒重来的方案固化进 Triton。融合核的进场条件：写之前定死**与"先还原再算"的注意力输出逐位或 ULP 级一致**。
+3. **记忆一律 fp16 存**（D34 第 4 条）：int4 只是**运行时 cache 的格式**，注入记忆时按当时格式量化 → **D09 的冻结判据不变**。要改这条必须新开决策 + 重测取回率。
+
+**260K 的账（算术推算）：** 262144 × 41.6 KiB = **10.4 GiB**，D17 预算内只剩 ~3.8 GiB → **int4 单独还差 ~2.7x**，跨层 KV 共享 / MLA（都要训练）仍然必需。
 
 ---
 
@@ -319,9 +342,9 @@ $env:HF_HUB_OFFLINE='1'; $env:TRITON_CACHE_DIR=$env:TMP+'\triton-cache'; $env:TO
 | `HANDOFF.md` | 本文件：执行顺序与交接 |
 | `README.md` | 项目总览与文档索引 |
 | `docs/01` ~ `docs/16` | 设计文档（15 愿景 / 02 架构 / 03 记忆 / 11 路线图 / 13 决策 / 15 语言 / 16 模型解剖） |
-| `src/` | 代码（S0-S4 全部完成；`nova/` 是双通路骨架 + 图解码 + **L0 记忆**，`chat.py` 交互 CLI，`diagnostics/` 是速度归因 + 记忆诊断脚本） |
-| `tests/` | 单元测试（**40 passed**：`test_nova_skeleton.py` 8 条 + `test_graph_decode.py` 4 条 + `test_nf4_linear.py` 11 条 + `test_lm_head4.py` 5 条 + **`test_memory.py` 12 条**） |
-| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / `speed-path1-nf4-gemv` / `s4-memory-min` / **`long-context-attention`**） |
+| `src/` | 代码（S0-S4 全部完成；`nova/` 是双通路骨架 + 图解码 + L0 记忆 + **KV 量化 `kvquant.py`**，`chat.py` 交互 CLI，`diagnostics/` 是速度归因 + 记忆诊断 + **KV 量化诊断**脚本） |
+| `tests/` | 单元测试（**54 passed**：`test_nova_skeleton.py` 8 条 + `test_graph_decode.py` 4 条 + `test_nf4_linear.py` 11 条 + `test_lm_head4.py` 5 条 + `test_memory.py` 12 条 + **`test_kvquant.py` 13 条**） |
+| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / `speed-path1-nf4-gemv` / `s4-memory-min` / `long-context-attention` / **`kv-int4`**） |
 | `data/` | 评测集、训练数据（待建，**放 H 盘更大的话用软链接**） |
 | `models/` | 本地权重（建议只放软链接，实体在 `H:\hf-cache`） |
 
