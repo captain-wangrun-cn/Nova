@@ -47,7 +47,7 @@ $env:TORCHINDUCTOR_CACHE_DIR='H:\Nova\.tmp\inductor-cache'
   此时**同一条命令会慢 1.9x**（实测：`bench_graph.py --paths 1 --no-hf --quant bnb --lm-head4`
   从 **14.0 ms/token 变 26.7 ms/token**）。**不同时间点测出来的数字不能直接对比**，必须连同 `clocks.sm` 一起记录。
 
-## 第三轮（2026-09-22 · 速度路径 ①，见 [reports/s4-nf4-gemv.md](../../reports/s4-nf4-gemv.md) 与 **D30**）
+## 第三轮（2026-09-22 · 速度路径 ①，见 [reports/speed-path1-nf4-gemv.md](../../reports/speed-path1-nf4-gemv.md) 与 **D30**）
 
 | 脚本 | 证明什么 | 命令 |
 |------|------|------|

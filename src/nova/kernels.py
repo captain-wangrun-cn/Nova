@@ -132,7 +132,7 @@ def fused_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.T
 # 为什么是 `[N, K//2]`（而不是转置成 `[K//2, N]`）：GEMV 的归约方向是 K，
 # 把 K 放在**最后一维**就能用 `tl.sum(axis=1)` 在寄存器内归约。
 #
-# **码本查表是唯一的硬成本**（实测，见 reports/s4-nf4-gemv.md）：
+# **码本查表是唯一的硬成本**（实测，见 reports/speed-path1-nf4-gemv.md）：
 # 一次 `tl.load(LUT + idx)` 这种发散访存约 3.5 SM-cycle/warp，而一个 ALU 算子只要 1。
 # 所以这里把**一个字节的两次查表压成一次**（表里直接存 fp16x2），
 # 把查表次数从「每元素一次」降到「每字节一次」。

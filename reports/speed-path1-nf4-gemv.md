@@ -1,4 +1,4 @@
-# S4 · 速度路径 ①：Triton NF4 GEMV —— 方向证伪，但顺手捡到 lm_head 的 2ms
+# 速度路径 ①：Triton NF4 GEMV —— 方向证伪，但顺手捡到 lm_head 的 2ms
 
 > 日期 **2026-09-22** · 状态：**路径 ① 已证伪并结案**；附带收益（4-bit lm_head）已落盘
 > 代码：[src/nova/kernels.py](../../src/nova/kernels.py)、[src/nova/quant.py](../../src/nova/quant.py)、[src/nova/loader.py](../../src/nova/loader.py)

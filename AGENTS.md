@@ -120,5 +120,5 @@ fix(model): lm_head_forward 无限递归，补逐位一致测试
 perf(model): lm_head 4-bit，单通路 16.0→14.0 ms/token
 exp(quant): 自写 Triton NF4 GEMV 证伪，速度路径 ① 结案
 feat(cli): 图解码交互 CLI，支持多轮与采样
-docs: D30 + reports/s4-nf4-gemv.md + HANDOFF 更新
+docs: D30 + reports/speed-path1-nf4-gemv.md + HANDOFF 更新
 ```

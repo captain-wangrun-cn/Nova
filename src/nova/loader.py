@@ -71,7 +71,7 @@ def enable_lm_head_4bit(
 ) -> Any:
     """给输出投影装一份 **4-bit 副本**（写到 `model.lm_head4`）。
 
-    动机（已核查，见 [reports/s4-nf4-gemv.md](../../reports/s4-nf4-gemv.md)）：
+    动机（已核查，见 [reports/speed-path1-nf4-gemv.md](../../reports/speed-path1-nf4-gemv.md)）：
     `lm_head` 复用 fp16 的 `embed_tokens.weight` 时，每 token 要读 **778 MB**
     （151936x2560x2B），实测 **3.11 ms**。这已经是 250 GB/s 的 DRAM 上限
     （"打满带宽"），但**降位宽能把要搬的数据砍到 1/4** —— 换 bnb `Linear4bit`

@@ -12,7 +12,7 @@
 | 设计文档 | ✅ **16 份，3359 行**（`docs/01` ~ `docs/16`） |
 | 决策 | ✅ **30 条**（`docs/13-decisions.md`）；D19 待定，D21/D22 已被 D23/D24 取代，**D26 技术归因已被 D27 更正**，**D30 取代 D29 第 2 条的路径排序**；新增 D25（token 效率实测）、D27（速度归因更正）、D28（S3 完成）、D29（CUDA Graph 解码）、**D30（速度路径 ① 结案 + lm_head 4-bit）** |
 | 教师选型 | ✅ **已冻结（v4 七层，D24）**，S5 直接执行，不要重新调研 |
-| 代码 | ✅ **S0-S3 全部完成 + S4 速度侧**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码 + 4-bit lm_head + 自写 NF4 kernel）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、`tests/`（**28 passed**）、`src/bench_nova.py`、`src/bench_graph.py`（`--quant` / `--lm-head4`）、`src/diagnostics/`（速度归因复现脚本） |
+| 代码 | ✅ **S0-S3 全部完成 + 速度路径 ①/②**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码 + 4-bit lm_head + 自写 NF4 kernel）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、`tests/`（**28 passed**）、`src/bench_nova.py`、`src/bench_graph.py`（`--quant` / `--lm-head4`）、`src/diagnostics/`（速度归因复现脚本） |
 | 环境 | ✅ torch 2.6.0+cu124 + 权重 **8.89 GB 已缓存**（`.hf-cache`）；基线 4-bit 峰值 **2.79 GiB**；**Nova 单通路图解码 14.0 ms/token（71.3 tok/s，3.28 GiB）/ 双通路 22.7 ms/token（44.0 tok/s，4.83 GiB）** |
 | 代码托管 | ✅ **<https://github.com/captain-wangrun-cn/Nova>**（**public**，默认分支 `main`）。提交规范见 [AGENTS.md](AGENTS.md) 第七节 |
 | 下一步 | **S4 · 记忆最小实现**（速度路径 ② 已落地；③/④ 并行推进，不互相阻塞） |
@@ -29,6 +29,7 @@
 > 4. **本机机器级环境变量 `HF_ENDPOINT=hf-mirror.com` 缺少协议头**，会让所有 HF 请求直接报 `UnsupportedProtocol`。**必须显式覆盖为带协议的形式：** `$env:HF_ENDPOINT='https://hf-mirror.com'`。
 > 5. **`AGENTS.md` 第五节的 `codex.exe` 硬编码路径已过期**（哈希目录从 `eab8377aebac6c07` 变成 `247581e40ee272fb`）。写文件时用 `$exe = (Get-Command codex).Source` 动态取，**不要照抄硬编码路径**。
 > 6. **`triton-windows 3.2.0.post21` 已装入 `.venv`**（与 torch 2.6.0 兼容；`3.8.0` 不兼容）。Triton / Inductor 缓存目录必须显式指向 H 盘（`TRITON_CACHE_DIR` / `TORCHINDUCTOR_CACHE_DIR`），否则报 `WinError 5`。**但 `torch.compile` 目前对本模型不可用**，见 **D27**。
+> 7. **命名澄清（易误判）：`reports/speed-path1-nf4-gemv.md` 与 `tests/test_nf4_linear.py` 属于「速度路径 ①」，不是路线图的 S4。** 路线图的 **S4 = 记忆最小实现**，截至 2026-09-22 **尚未开始**。这两处此前误标了 "S4"，已改名/改标题。
 
 ---
 
@@ -185,7 +186,7 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 
 ## 六·补 · 速度路径 ①：Triton NF4 GEMV（✅ 2026-09-22 结案 —— **方向证伪**）
 
-> 完整报告：[reports/s4-nf4-gemv.md](reports/s4-nf4-gemv.md) · 决策 **D30**（取代 D29 第 2 条的路径排序）
+> 完整报告：[reports/speed-path1-nf4-gemv.md](reports/speed-path1-nf4-gemv.md) · 决策 **D30**（取代 D29 第 2 条的路径排序）
 
 **结论：自写 Triton NF4 GEMV 打不过 bnb。路径 ① 结案，不再投入。**
 
@@ -262,7 +263,7 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 | `docs/01` ~ `docs/15` | 设计文档（15 愿景 / 02 架构 / 03 记忆 / 11 路线图 / 13 决策 / 15 语言） |
 | `src/` | 代码（S0-S3 全部完成；`nova/` 是双通路骨架 + 图解码，`diagnostics/` 是速度归因复现脚本） |
 | `tests/` | 单元测试（**28 passed**：`test_nova_skeleton.py` 8 条 + `test_graph_decode.py` 4 条 + `test_nf4_linear.py` 11 条 + **`test_lm_head4.py` 5 条**） |
-| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / **`s4-nf4-gemv`**） |
+| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / **`speed-path1-nf4-gemv`**） |
 | `data/` | 评测集、训练数据（待建，**放 H 盘更大的话用软链接**） |
 | `models/` | 本地权重（建议只放软链接，实体在 `H:\hf-cache`） |
 
@@ -329,7 +330,7 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 
 > **进度（2026-09-22 会话 · 第四轮）：速度路径 ① ✅ 结案 —— 方向证伪，但顺手捡到 lm_head 的 2ms。**
 >
-> **① 自写 Triton NF4 GEMV 打不过 bnb，不再投入**（完整证据 [reports/s4-nf4-gemv.md](reports/s4-nf4-gemv.md)，决策 **D30**）：
+> **① 自写 Triton NF4 GEMV 打不过 bnb，不再投入**（完整证据 [reports/speed-path1-nf4-gemv.md](reports/speed-path1-nf4-gemv.md)，决策 **D30**）：
 >
 > | 证据 | 数字 |
 > |------|------|

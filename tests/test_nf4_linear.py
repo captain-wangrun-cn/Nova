@@ -1,6 +1,6 @@
-"""S4 · Triton NF4 GEMV 的验收测试。
+"""速度路径 ① · Triton NF4 GEMV 的验收测试。
 
-对应 [reports/s4-nf4-gemv.md](../reports/s4-nf4-gemv.md)：
+对应 [reports/speed-path1-nf4-gemv.md](../reports/speed-path1-nf4-gemv.md)：
 
 | 测试 | 判据 |
 |------|------|
