@@ -10,12 +10,12 @@
 | 项 | 状态 |
 |------|------|
 | 设计文档 | ✅ **16 份，3359 行**（`docs/01` ~ `docs/16`） |
-| 决策 | ✅ **30 条**（`docs/13-decisions.md`）；D19 待定，D21/D22 已被 D23/D24 取代，**D26 技术归因已被 D27 更正**，**D30 取代 D29 第 2 条的路径排序**；新增 D25（token 效率实测）、D27（速度归因更正）、D28（S3 完成）、D29（CUDA Graph 解码）、**D30（速度路径 ① 结案 + lm_head 4-bit）** |
+| 决策 | ✅ **31 条**（`docs/13-decisions.md`）；D19 待定，D21/D22 已被 D23/D24 取代，**D26 技术归因已被 D27 更正**，**D30 取代 D29 第 2 条的路径排序**；新增 D28（S3 完成）、D29（CUDA Graph 解码）、D30（速度路径 ① 结案 + lm_head 4-bit）、**D31（S4 记忆最小实现）** |
 | 教师选型 | ✅ **已冻结（v4 七层，D24）**，S5 直接执行，不要重新调研 |
-| 代码 | ✅ **S0-S3 全部完成 + 速度路径 ①/②**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码 + 4-bit lm_head + 自写 NF4 kernel）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、`tests/`（**28 passed**）、`src/bench_nova.py`、`src/bench_graph.py`（`--quant` / `--lm-head4`）、`src/diagnostics/`（速度归因复现脚本） |
+| 代码 | ✅ **S0-S4 全部完成 + 速度路径 ①/②**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码 + 4-bit lm_head + **L0 记忆 `memory.py`**）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、**`src/s4_memory_demo.py`**、`tests/`（**40 passed**）、`src/bench_nova.py`、`src/bench_graph.py`、**`src/bench_memory.py`**、`src/diagnostics/`（速度归因 + 记忆诊断脚本） |
 | 环境 | ✅ torch 2.6.0+cu124 + 权重 **8.89 GB 已缓存**（`.hf-cache`）；基线 4-bit 峰值 **2.79 GiB**；**Nova 单通路图解码 14.0 ms/token（71.3 tok/s，3.28 GiB）/ 双通路 22.7 ms/token（44.0 tok/s，4.83 GiB）** |
 | 代码托管 | ✅ **<https://github.com/captain-wangrun-cn/Nova>**（**public**，默认分支 `main`）。提交规范见 [AGENTS.md](AGENTS.md) 第七节 |
-| 下一步 | **S4 · 记忆最小实现**（速度路径 ② 已落地；③/④ 并行推进，不互相阻塞） |
+| 下一步 | **S5 · 数据与蒸馏**（里程碑 2 起点）；速度侧 **③ 融合 RoPE / 去冗余拷贝 → ④ 融合注意力**；记忆侧见第七节"下一步优化" |
 
 **一句话：设计做完了，现在要开始证明"双通路 + 内部记忆"在 8GB 显存上真的能跑。**
 
@@ -29,7 +29,7 @@
 > 4. **本机机器级环境变量 `HF_ENDPOINT=hf-mirror.com` 缺少协议头**，会让所有 HF 请求直接报 `UnsupportedProtocol`。**必须显式覆盖为带协议的形式：** `$env:HF_ENDPOINT='https://hf-mirror.com'`。
 > 5. **`AGENTS.md` 第五节的 `codex.exe` 硬编码路径已过期**（哈希目录从 `eab8377aebac6c07` 变成 `247581e40ee272fb`）。写文件时用 `$exe = (Get-Command codex).Source` 动态取，**不要照抄硬编码路径**。
 > 6. **`triton-windows 3.2.0.post21` 已装入 `.venv`**（与 torch 2.6.0 兼容；`3.8.0` 不兼容）。Triton / Inductor 缓存目录必须显式指向 H 盘（`TRITON_CACHE_DIR` / `TORCHINDUCTOR_CACHE_DIR`），否则报 `WinError 5`。**但 `torch.compile` 目前对本模型不可用**，见 **D27**。
-> 7. **命名澄清（易误判）：`reports/speed-path1-nf4-gemv.md` 与 `tests/test_nf4_linear.py` 属于「速度路径 ①」，不是路线图的 S4。** 路线图的 **S4 = 记忆最小实现**，截至 2026-09-22 **尚未开始**。这两处此前误标了 "S4"，已改名/改标题。
+> 7. **命名澄清（易误判）：`reports/speed-path1-nf4-gemv.md` 与 `tests/test_nf4_linear.py` 属于「速度路径 ①」，不是路线图的 S4。** 路线图的 **S4 = 记忆最小实现**，已在 **2026-09-22 完成**（见第七节）。这两处此前误标了 "S4"，已改名/改标题。
 
 ---
 
@@ -41,7 +41,7 @@
 | **S1** | Tokenizer 探针 | 1 小时 | ✅ **已完成** —— [reports/tokenizer-report.md](reports/tokenizer-report.md) |
 | **S2** | 单通路基线 | 半天 | ✅ **已完成** —— [reports/baseline-qwen3vl4b.md](reports/baseline-qwen3vl4b.md)（4-bit 10.64 tok/s / 8-bit 4.91 tok/s / 峰值 2.79 GiB） |
 | **S3** | **双通路骨架** | 2-4 天 | ✅ **已完成** —— [reports/s3-dual-path-skeleton.md](reports/s3-dual-path-skeleton.md)（8 passed / 门控关闭**逐位一致** / 峰值 4.57 GiB） |
-| **S4** | 记忆最小实现 | 2-3 天 | 第 1 轮写入 → 第 20 轮取回；存盘重启后仍可取回 |
+| **S4** | 记忆最小实现 | 2-3 天 | ✅ **已完成** —— [reports/s4-memory-min.md](reports/s4-memory-min.md)（**8/8 取回** / 不注入 0/8 / 跨进程可复现 / 峰值 5.17 GiB） |
 | **S5** | 数据与蒸馏 | 里程碑 2 | 500-1000 条跑通管线（届时再开） |
 
 **排序原则：**
@@ -219,12 +219,37 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 
 ---
 
-## 七、S4 · 记忆最小实现
+## 七、S4 · 记忆最小实现（✅ 已完成 2026-09-22 —— **8/8 取回，跨进程可复现**）
 
-- 记忆令牌 + 键值联想检索 + safetensors 读写 + **表示空间冻结**（D09）。
-- 最小测试：**第 1 轮被告知"红裙子" → 第 20 轮提问能否答对**；存盘 → 重启 → 仍能答对。
-- 这就是"换衣服"案例（[docs/03-memory-system.md](docs/03-memory-system.md)）的最小可测形式。
-- **本阶段不做**：遗忘机制、巩固机制、多时间尺度记忆（留给里程碑 3）。
+**报告：[reports/s4-memory-min.md](reports/s4-memory-min.md) · 决策 D31 · 演示 `src/s4_memory_demo.py` · 基准 `src/bench_memory.py`**
+
+```powershell
+$env:HF_HOME=(Resolve-Path .).Path+'\.hf-cache'; $env:TMP=(Resolve-Path .).Path+'\.tmp'; $env:TEMP=$env:TMP
+$env:HF_HUB_OFFLINE='1'; $env:TRITON_CACHE_DIR=$env:TMP+'\triton-cache'; $env:TORCHINDUCTOR_CACHE_DIR=$env:TMP+'\inductor-cache'
+
+& .\.venv\Scripts\python.exe -m pytest tests -q          # 40 passed（新增 tests/test_memory.py 12 条）
+& .\.venv\Scripts\python.exe src\s4_memory_demo.py --phase write --mem .tmp\s4-memory\demo.safetensors
+& .\.venv\Scripts\python.exe src\s4_memory_demo.py --phase ask   --mem .tmp\s4-memory\demo.safetensors
+& .\.venv\Scripts\python.exe src\bench_memory.py --reps 7 --warmup 2
+```
+
+**验收标准达成（已核查）：** 第 1 轮写入 6 条事实 → 第 1 轮从可见历史里去掉（压缩进记忆）→ 20 轮无关对话（608 token）→ 第 22 轮 8 个问题 **8/8 全对**；不注入 **0/8**（反问 / 编造）、故意注入另一条 **0/8**（原答案不再出现）；**write / ask 是两个独立进程**，只通过 `.safetensors` 传递 → 8/8。峰值显存 **5.17 GiB**（D17 内）。
+
+**机制：L0「精确 KV」层，不是 docs/03 的 `[128, 2560]` 记忆令牌。** 后者是**要训练**的写入器 / 读取器，属里程碑 2（D31 第 1 条）。S4 的写入 = 抓区间的 K（RoPE 前）/ V；寻址 = 模型**自己的** `Q·K`；读取 = 按新位置重新旋转后写进 KV cache。**零新增参数、零训练**。
+
+**新会话必读的四条（都是实测逼出来的）：**
+
+1. **记忆插在"当前轮之前"（`place="turn"`），不是最前面。** 插最前面在 20 轮历史下寻址退化到 1/3，**且生成质量崩**（复读"今天多云转晴"）—— RoPE 长距离把 `Q·K` 抹平。**这条推翻了 docs/03 的原始写法。**
+2. **寻址必须按注入后的真实位置旋转 Q/K 再算 `Q·K`，并用 softmax 质量。** pre-RoPE 裸余弦对 6 条候选**全部 > 0.8**，几乎不区分内容。
+3. **查询取"问题那句话的末尾 4 个 token"。** 取 prompt 最后 4 个拿到的是 `<|im_start|>assistant\n`（**没有内容**）→ 退化；整句取平均 8/8 掉 7/8。
+4. **检索逻辑只写一份**（`MemorySession.rank()`），`prefill` 与测试都走它。第一版测试自己手搓打分、忘了截末尾 4 token，命中率立刻从 8/8 掉 7/8。
+
+**开销（速度数字带 `clocks.sm`）：** 检索 ≈ **1x 一次基线前向**（与时钟无关的比值 0.94–0.98x，因为取 Q 要跑一次完整无 cache 前向）；打分 40–90 ms；**注入 ≈ 0**（三次独立测量 −41 / −40 / −12 ms）。记忆体积 **240 KiB/token**。
+⚠️ **连测 7 轮会把笔记本 GPU 从 2160 MHz 压到 ~870 MHz（94 W → 35 W），同一条件耗时翻倍** —— 基准已内置预热与逐轮 `clocks.sm` 采样。
+
+**已知边界：** 无损不压缩；键未训练（区分度是实测，不是设计保证）；**LoRA / 微调会让 K/V 空间漂移，匹配质量衰减待实测**（里程碑 2 必测）；通路 0/1 各存一份（2× 冗余）；检索不能跨轮复用。
+
+**本阶段不做：** 遗忘 / 巩固 / 多时间尺度（里程碑 3）。
 
 ---
 
@@ -260,10 +285,10 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 | `AGENTS.md` | 规则、硬约束、环境事实、写文件方法 |
 | `HANDOFF.md` | 本文件：执行顺序与交接 |
 | `README.md` | 项目总览与文档索引 |
-| `docs/01` ~ `docs/15` | 设计文档（15 愿景 / 02 架构 / 03 记忆 / 11 路线图 / 13 决策 / 15 语言） |
-| `src/` | 代码（S0-S3 全部完成；`nova/` 是双通路骨架 + 图解码，`diagnostics/` 是速度归因复现脚本） |
-| `tests/` | 单元测试（**28 passed**：`test_nova_skeleton.py` 8 条 + `test_graph_decode.py` 4 条 + `test_nf4_linear.py` 11 条 + **`test_lm_head4.py` 5 条**） |
-| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / **`speed-path1-nf4-gemv`**） |
+| `docs/01` ~ `docs/16` | 设计文档（15 愿景 / 02 架构 / 03 记忆 / 11 路线图 / 13 决策 / 15 语言 / 16 模型解剖） |
+| `src/` | 代码（S0-S4 全部完成；`nova/` 是双通路骨架 + 图解码 + **L0 记忆**，`chat.py` 交互 CLI，`diagnostics/` 是速度归因 + 记忆诊断脚本） |
+| `tests/` | 单元测试（**40 passed**：`test_nova_skeleton.py` 8 条 + `test_graph_decode.py` 4 条 + `test_nf4_linear.py` 11 条 + `test_lm_head4.py` 5 条 + **`test_memory.py` 12 条**） |
+| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / `speed-path1-nf4-gemv` / **`s4-memory-min`**） |
 | `data/` | 评测集、训练数据（待建，**放 H 盘更大的话用软链接**） |
 | `models/` | 本地权重（建议只放软链接，实体在 `H:\hf-cache`） |
 
@@ -357,7 +382,7 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 >
 > **剩余空间：** 单通路 36 层 bnb **9.79 ms** vs DRAM 下界 **8.20 ms**，**只剩 1.19x**。
 >
-> **下一步：** **S4 · 记忆最小实现**（主线，此前一直被速度工作挤后）；速度侧 **③ 融合 RoPE / 去冗余拷贝 → ④ 融合注意力**。
+> **下一步：** **S4 · 记忆最小实现**已在 2026-09-22 完成（见第七节）；速度侧 **③ 融合 RoPE / 去冗余拷贝 → ④ 融合注意力**。
 
 ---
 
