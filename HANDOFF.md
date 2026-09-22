@@ -12,7 +12,7 @@
 | 设计文档 | ✅ **16 份，3359 行**（`docs/01` ~ `docs/16`） |
 | 决策 | ✅ **30 条**（`docs/13-decisions.md`）；D19 待定，D21/D22 已被 D23/D24 取代，**D26 技术归因已被 D27 更正**，**D30 取代 D29 第 2 条的路径排序**；新增 D25（token 效率实测）、D27（速度归因更正）、D28（S3 完成）、D29（CUDA Graph 解码）、**D30（速度路径 ① 结案 + lm_head 4-bit）** |
 | 教师选型 | ✅ **已冻结（v4 七层，D24）**，S5 直接执行，不要重新调研 |
-| 代码 | ✅ **S0 / S1 / S2 / S3 已完成**：`src/chatfmt.py`、`src/tokenizer_probe.py`、`src/baseline.py`、**`src/nova/`（双通路骨架 + 静态 KV cache + CUDA Graph 解码）**、`tests/`、`src/bench_nova.py`、`src/bench_graph.py` |
+| 代码 | ✅ **S0-S3 全部完成 + S4 速度侧**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码 + 4-bit lm_head + 自写 NF4 kernel）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、`tests/`（**28 passed**）、`src/bench_nova.py`、`src/bench_graph.py`（`--quant` / `--lm-head4`）、`src/diagnostics/`（速度归因复现脚本） |
 | 环境 | ✅ torch 2.6.0+cu124 + 权重 **8.89 GB 已缓存**（`.hf-cache`）；基线 4-bit 峰值 **2.79 GiB**；**Nova 单通路图解码 14.0 ms/token（71.3 tok/s，3.28 GiB）/ 双通路 22.7 ms/token（44.0 tok/s，4.83 GiB）** |
 | 代码托管 | ✅ **<https://github.com/captain-wangrun-cn/Nova>**（**public**，默认分支 `main`）。提交规范见 [AGENTS.md](AGENTS.md) 第七节 |
 | 下一步 | **S4 · 记忆最小实现**（速度路径 ② 已落地；③/④ 并行推进，不互相阻塞） |
