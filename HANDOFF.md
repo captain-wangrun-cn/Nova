@@ -15,7 +15,7 @@
 | 代码 | ✅ **S0-S4 全部完成 + 速度路径 ①/② + KV int4 测量 + P0 解码分桶**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码（**分桶：`BUCKETS`/`for_length`/`grow`**）+ 4-bit lm_head + L0 记忆 `memory.py` + KV 量化 `kvquant.py`）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、**`src/s4_memory_demo.py`**、`tests/`（**60 passed**）、`src/bench_nova.py`、`src/bench_graph.py`、`src/bench_memory.py`、`src/diagnostics/`（速度归因 + 记忆诊断 + KV 量化诊断 + **重捕/分桶诊断**） |
 | 环境 | ✅ torch 2.6.0+cu124 + 权重 **8.89 GB 已缓存**（`.hf-cache`）；基线 4-bit 峰值 **2.79 GiB**；**Nova 单通路图解码 14.0 ms/token（71.3 tok/s，3.28 GiB）/ 双通路 22.7 ms/token（44.0 tok/s，4.83 GiB）** |
 | 代码托管 | ✅ **<https://github.com/captain-wangrun-cn/Nova>**（**public**，默认分支 `main`）。提交规范见 [AGENTS.md](AGENTS.md) 第七节 |
-| 下一步 | **第五轮 · 五条证伪实验 + PCIe/主机内存分层**（顺序与门控见第六·补四节）：**E1** 路由召回率（top-norm-K vs mean-K）→ **E2** 免费版滑窗（W ∈ {1024,2048,4096}；16K 全量基线 + 32K/64K 滑窗；**必测滑窗下的 S4 记忆取回**）→ **E3** 8 位 KV 对照 → **E4** 窄化 Triton 证伪（M=1 解包微基准）→ **E5** 干扰项 4/16/64 → **E6** PCIe/主机内存分层；然后 **S5 · 数据与蒸馏**（里程碑 2 起点） |
+| 下一步 | **第五轮 · 五条证伪实验 + PCIe/主机内存分层**（顺序与门控见第六·补四节）：**E1** ✅ 已结案（不 adopt，见第六·补五）→ **E2** 免费版滑窗（W ∈ {1024,2048,4096}；16K 全量基线 + 32K/64K 滑窗；**必测滑窗下的 S4 记忆取回**）→ **E3** 8 位 KV 对照 → **E4** 窄化 Triton 证伪（M=1 解包微基准）→ **E5** 干扰项 4/16/64 → **E6** PCIe/主机内存分层；然后 **S5 · 数据与蒸馏**（里程碑 2 起点） |
 
 **一句话：设计做完了，现在要开始证明"双通路 + 内部记忆"在 8GB 显存上真的能跑。**
 
@@ -291,6 +291,20 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 
 ---
 
+## 六·补五 · E1 记忆路由（✅ 2026-09-22 —— **判据未达，不 adopt**）
+
+**报告：[reports/memory-routing.md](reports/memory-routing.md) · 决策 D36 · 探针 `src/diagnostics/probe_memory_routing.py`**
+
+**已核查（三档段长，干草堆 7291 token / 4 条形近事实 / `clocks.sm` 2460）：**
+
+1. **段级静态代表 K 路由达不到判据**：`recall@4` 在 seg=1024/256/64 上分别是 **0.75 / 0.25 / 0.75**（要求 ≥ 0.95）⇒ **不 adopt**。精确路径（现有 `MemoryStore.scores()`）三档**都是 1.00**。
+2. **`top-‖K‖` 明显差于 `mean-K`**：侧会话"用范数最大的、不要用平均"**被证伪**（最差一档名次 **93/112**）。段级平均 `‖K‖` 的最大/中位只有 **1.00x** ⇒ 连"挑出 attention sink 段"这件事它都做不到。
+3. **旋转不是变量**：pre-RoPE / 注入帧旋转 / 旋转后平均，每档差距 ≤ 1 名。
+4. 代价：精确 **3192–3278 ms/题** vs 路由器 **2.03 ms/题**（28 段）⇒ 路由器快约 1500x，但**不够准**；精确够准，但 **100K 记忆要扫 7.2 GB（显存放不下）** —— 这才是真问题。
+
+**下一步的替代方向（都还没测）**：查询相关的粗筛 + 小集合内精确重排；或把 K 压小但**别丢 token**（**E3** 覆盖量化那条）。
+
+--- ## 七、S4 · 记忆最小实现（✅ 已完成 2026-09-22 —— **8/8 取回，跨进程可复现**）
 ## 七、S4 · 记忆最小实现（✅ 已完成 2026-09-22 —— **8/8 取回，跨进程可复现**）
 
 **报告：[reports/s4-memory-min.md](reports/s4-memory-min.md) · 决策 D31 · 演示 `src/s4_memory_demo.py` · 基准 `src/bench_memory.py`**
