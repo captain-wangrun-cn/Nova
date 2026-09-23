@@ -11,14 +11,76 @@
 
 **前提**：KV cache 必须是定长原地写入（`StaticKVCache`），
 且图内**不能有任何 `.item()` / CPU 同步 / 动态形状**。
+
+**P0 之后的两条改动**（2026-09-22，见 [reports/decode-mask-bucket.md](../../reports/decode-mask-bucket.md)）：
+
+1. **加性掩码不再预分配 O(max_len²) 的表** —— 65536 时是 **8.0 GiB**，比 KV cache 更早爆，
+   它是"上下文上限"的第一堵墙。改成**图内即时构造一行**，常驻从 `max_len²×2` 降到 `max_len×2`。
+2. **容量按桶分配**（`BUCKETS`）：decode 的 KV 读量与掩码长度都跟"分配的槽位数"走，不跟真实长度走。
+   预留 18432 而只写 2048 时，**89% 的 KV 读发生在没写过的零槽位上**。
+   跨桶用 `grow()` 搬家 + 重捕（**实测重捕不泄漏**；共享 graph pool 反而会踩 PyTorch 的裸 assert，
+   所以默认不开 —— 证据见 `src/diagnostics/probe_graph_recapture.py`）。
 """
 
 from __future__ import annotations
+
+import weakref
 
 import torch
 import torch.nn.functional as F
 
 from .cache import StaticKVCache
+
+# ---- 容量分桶 ----
+
+# 桶边界（token）。选这些数是因为它们覆盖了本项目实际会用的档位：
+# 2048 档留 22 个 token 余量（chat 模板 + 生成），再往上每翻一倍一档。
+BUCKETS: tuple[int, ...] = (2070, 4096, 8192, 16384, 32768, 65536)
+
+
+def bucket_for(n: int, buckets: tuple[int, ...] = BUCKETS) -> int:
+    """不小于 `n` 的最小桶。超过最大的桶就按 `n` 精确分配（不做无限分桶）。"""
+    n = int(n)
+    for b in buckets:
+        if n <= b:
+            return int(b)
+    return n
+
+
+_GRAPH_POOL = None
+_POOL_USERS: list = []  # 用过当前池的 `CUDAGraph` 的弱引用
+
+
+def shared_graph_pool(fresh_if_idle: bool = True):
+    """取一个可用的 CUDA Graph 内存池。
+
+    **背景**：旧报告写过"每题重捕，重捕 9 次就把显存顶到 7905 / 8188 MiB 然后崩"，
+    据此引入共享池。但 P0 的实测（`probe_graph_recapture.py`）**推翻了这条**：
+    每轮显式 `del` + `gc` + `empty_cache` 之后，逐轮 allocated 基本是平的，
+    三种策略（不共享 / 共享 / 自适应）都不涨。图上一次没被正确释放才是真凶，
+    不是"没共享池"。
+
+    ⚠️ **实测的 PyTorch 坑**：把一个**已经销毁**的图用过的池再拿去捕获新图，会在
+    `CUDACachingAllocator.cpp:2225` 抛裸 assert
+    `it->second->use_count > 0 INTERNAL ASSERT FAILED`（没有消息，很难查）。
+    而且它只在**特定分配器状态**下触发：`tests/test_decode_mask_bucket.py` 全量跑会中，
+    单跑那一题不会 —— 脚本里复现不出来，所以只能绕开。
+
+    `fresh_if_idle=True`（`pool="auto"`）时跟踪"池的活用户"：上一个用它的图还活着就复用，
+    否则换新池；`False`（`pool="shared"`）就是死用一个池，专门用来复现上面那个 assert。
+    两条都不是默认路径（默认 `pool="off"`）。
+    """
+    global _GRAPH_POOL
+    alive = [w for w in _POOL_USERS if w() is not None]
+    _POOL_USERS[:] = alive
+    if _GRAPH_POOL is None or (fresh_if_idle and not alive):
+        _GRAPH_POOL = torch.cuda.graph_pool_handle()
+    return _GRAPH_POOL
+
+
+def register_pool_user(graph: torch.cuda.CUDAGraph) -> None:
+    """登记"这张图用了当前池"。弱引用，图被回收后自动退出统计。"""
+    _POOL_USERS.append(weakref.ref(graph))
 
 
 class GraphDecoder:
@@ -59,7 +121,11 @@ class GraphDecoder:
             device=device,
         )
         self.input_ids = torch.zeros(batch, 1, dtype=torch.long, device=device)
-        self.mask_table = self._build_mask_table(max_len, dtype, device)
+        # ⚠️ 不再分配 `(max_len, max_len)` 的掩码表。只留一份 arange 与两个 0 维标量，
+        # 掩码在 `_mask_row()` 里即时构造 —— 形状恒定，图内安全，与旧表逐位一致。
+        self._arange = torch.arange(max_len, dtype=torch.long, device=device)
+        self._zero = torch.zeros((), dtype=dtype, device=device)
+        self._ninf = torch.full((), torch.finfo(dtype).min, dtype=dtype, device=device)
         self.graph: torch.cuda.CUDAGraph | None = None
         self.logits: torch.Tensor | None = None
         self._captured = False
@@ -70,7 +136,9 @@ class GraphDecoder:
     def _build_mask_table(max_len: int, dtype: torch.dtype, device) -> torch.Tensor:
         """`table[pos]` = 加性 attention mask：前 `pos+1` 位为 0，其余为 -inf。
 
-        预先算好整张表，图内只需一次 `index_select` 就能取到当前行 —— 形状恒定。
+        ⚠️ **解码路径已经不用它了**（改成 `_mask_row` 图内即时构造）。留着只为两件事：
+        与旧实现**逐位对照**（`tests/test_graph_decode.py`）、以及核算"旧方案要多少显存"。
+        **别在生产路径里调**：`max_len=65536` 时要 8.0 GiB。
         """
         neg = torch.finfo(dtype).min
         idx = torch.arange(max_len, device=device)
@@ -78,6 +146,22 @@ class GraphDecoder:
         zero = torch.zeros((), dtype=dtype, device=device)
         ninf = torch.full((), neg, dtype=dtype, device=device)
         return torch.where(keep, zero, ninf)
+
+    @classmethod
+    def for_length(cls, model, n_tokens: int, reserve: int = 64, **kwargs) -> "GraphDecoder":
+        """按"要用多少 token"选桶 —— 而不是随手给一个巨大的 `max_len`。
+
+        预设 18432 却只用到 2048 时，decode 要读满 18432 个槽位（实测 139.3 ms/token，
+        `clocks.sm` 2475）；按桶给 2070 就是 60.4 ms/token。`reserve` 留给生成的新 token。
+        """
+        return cls(model, max_len=bucket_for(int(n_tokens) + int(reserve)), **kwargs)
+
+    def _mask_row(self, pos: torch.Tensor) -> torch.Tensor:
+        """`pos` 那一行的加性掩码（前 `pos+1` 位 0，其余 -inf），形状恒为 `(1,1,1,max_len)`。
+
+        与 `_build_mask_table(max_len)[pos]` **逐位一致**，但不占 `max_len²` 的常驻。
+        """
+        return torch.where(self._arange <= pos, self._zero, self._ninf).view(1, 1, 1, self.max_len)
 
     # ---- eager prefill ----
 
@@ -110,7 +194,8 @@ class GraphDecoder:
         self.cache.pos.fill_(offset)
         if offset:
             rows = torch.arange(offset, offset + n, device=self.cache.pos.device)
-            mask = self.mask_table.index_select(0, rows).view(1, 1, n, self.max_len)
+            keep = self._arange.view(1, 1, 1, -1) <= rows.view(1, 1, n, 1)
+            mask = torch.where(keep, self._zero, self._ninf)
             out = self.model(
                 input_ids=input_ids, past_key_values=self.cache, attention_mask=mask,
                 cross_mode="off", logits_to_keep=1,
@@ -133,7 +218,7 @@ class GraphDecoder:
         t = self.text
         pos = self.cache.pos
         position_ids = pos.view(1, 1, 1).expand(3, self.batch, 1)
-        mask = self.mask_table.index_select(0, pos).view(1, 1, 1, self.max_len)
+        mask = self._mask_row(pos)
         hidden = t(
             input_ids=self.input_ids,
             past_key_values=self.cache,
@@ -149,8 +234,26 @@ class GraphDecoder:
 
     # ---- 捕获 / 回放 ----
 
-    def capture(self, warmup: int = 3) -> None:
-        """捕获。调用前必须先 `prefill()`（`pos` 决定图的起始位置）。"""
+    def capture(self, warmup: int = 3, pool: str | object = "off") -> None:
+        """捕获。调用前必须先 `prefill()`（`pos` 决定图的起始位置）。
+
+        `pool` 四档：
+
+        | 取值 | 行为 |
+        |---|---|
+        | `"off"`（**默认**） | 不传池，每张图用自己的 —— **实测不泄漏**，见下面的实测 |
+        | `"auto"` | 上一个用池的图还活着就复用，否则换新池 |
+        | `"shared"` | 死用一个池。会踩 PyTorch 的裸 assert，只用于复现 |
+        | 其它 | 直接当 pool handle 传给 `torch.cuda.graph` |
+
+        ⚠️ **为什么默认不是共享池**（实测，`probe_graph_recapture.py`）：
+        ① "重捕就爆显存"的说法**不成立** —— 每轮 `del` + `gc` + `empty_cache` 之后
+        allocated 逐轮稳定（4 轮基本平的），起点/终点都不涨，三种策略都一样；
+        ② 共享池反而会踩 `CUDACachingAllocator.cpp:2225` 的裸 assert
+        （`it->second->use_count > 0`），而且只在**特定分配器状态**下触发、脚本里复现不出来
+        （`tests/test_decode_mask_bucket.py` 全量跑会中，单跑不会）。
+        所以默认走最朴素、没有额外机制的一档；要共享得自己传 pool 并承担上面那个坑。
+        """
         self.model.eval()
         start = int(self.cache.pos.item())
         saved_ids = self.input_ids.clone()
@@ -169,11 +272,54 @@ class GraphDecoder:
         self.input_ids.copy_(saved_ids)
 
         g = torch.cuda.CUDAGraph()
+        if pool == "off":
+            handle = None
+        elif pool in ("auto", "shared"):
+            handle = shared_graph_pool(fresh_if_idle=(pool == "auto"))
+        else:
+            handle = pool
         with torch.inference_mode():
-            with torch.cuda.graph(g):
+            with torch.cuda.graph(g, pool=handle):
                 self.logits = self._body()
         self.graph = g
         self._captured = True
+        if handle is not None:
+            register_pool_user(g)
+
+    def grow(self, new_max_len: int) -> None:
+        """把已写入的 KV 搬进更大的 cache（**跨桶**时用）。形状变了 ⇒ 必须重捕图。
+
+        返回时 `_captured` 已被清成 False，调用者负责重新 `capture()`。
+
+        ⚠️ **故意不加 `@torch.inference_mode()`**：这里的 `torch.zeros` 造出来的新 cache
+        会变成 **inference tensor**，而 `capture()` 在 inference_mode **之外**调
+        （它自己内部才开），届时 `cache.pos.fill_(...)` 会报
+        "Inplace update to inference tensor outside InferenceMode is not allowed"（实测踩过）。
+        """
+        new_max_len = int(new_max_len)
+        if new_max_len <= self.max_len:
+            return
+        used = int(self.cache.pos.item())
+        old = self.cache
+        new = StaticKVCache(
+            num_slots=old.num_slots,
+            num_kv_heads=self.cfg.num_key_value_heads,
+            head_dim=self.cfg.head_dim,
+            max_len=new_max_len,
+            batch=self.batch,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        for i in range(new.num_slots):
+            new.key_cache[i][:, :, :used] = old.key_cache[i][:, :, :used]
+            new.value_cache[i][:, :, :used] = old.value_cache[i][:, :, :used]
+        new.pos.fill_(used)
+        self.cache = new
+        self.max_len = new_max_len
+        self._arange = torch.arange(new_max_len, dtype=torch.long, device=self.device)
+        self.graph = None
+        self._captured = False
+        del old
 
     @torch.inference_mode()
     def step(self) -> torch.Tensor:

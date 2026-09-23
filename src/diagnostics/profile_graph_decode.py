@@ -95,7 +95,7 @@ def main() -> None:
     def body_layers_only():
         pos = dec.cache.pos
         position_ids = pos.view(1, 1, 1).expand(3, 1, 1)
-        mask = dec.mask_table.index_select(0, pos).view(1, 1, 1, dec.max_len)
+        mask = dec._mask_row(pos)
         hidden = t(
             input_ids=dec.input_ids,
             past_key_values=dec.cache,

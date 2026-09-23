@@ -71,8 +71,12 @@ def main() -> None:
     print(f"  权重（模型）      : {gib(torch.cuda.memory_allocated()):.2f} GiB")
     print(f"  KV cache ({args.max_len} 槽位): {dec.cache.nbytes() / 1024 ** 3:.2f} GiB"
           f"  = {dec.cache.nbytes() / args.max_len / 1024:.0f} KiB/token")
-    print(f"  mask_table        : {dec.mask_table.numel() * dec.mask_table.element_size() / 1024 ** 3:.2f} GiB"
-          f"  （{tuple(dec.mask_table.shape)} {dec.mask_table.dtype}）")
+    # P0 之后掩码不再预分配整表：常驻只有一份 arange(int64)，掩码行(fp16)在图内即时构造
+    arange_mib = dec._arange.numel() * dec._arange.element_size() / 1024 ** 2
+    row_kib = dec.max_len * 2 / 1024
+    old_gib = dec.max_len * dec.max_len * 2 / 1024 ** 3
+    print(f"  mask（即时构造）  : 常驻 arange {arange_mib:.3f} MiB(int64)"
+          f" + 图内掩码行 {row_kib:.1f} KiB(fp16)  —— 旧方案整表要 {old_gib:.2f} GiB")
 
     print(f"\n=== prefill 峰值显存随长度的增长 ===")
     print(f"{'token':>7s} {'峰值':>9s} {'比上一档':>9s}   （翻倍长度：2x=线性，4x=O(n^2)）")

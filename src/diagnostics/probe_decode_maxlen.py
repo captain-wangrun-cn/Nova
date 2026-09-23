@@ -12,6 +12,9 @@ r"""decode 每 token 耗时到底由"实际长度"还是"`max_len`"决定？
 判据：`GraphDecoder._body()` 传的 mask 覆盖整个 `max_len`，而 `q_len == 1` 时
 `layers.py` 里 `is_causal = False` ⇒ SDPA 会读满 `max_len` 个槽位 ⇒ **耗时应当只跟 `max_len` 走**。
 
+P0 之后再看一眼**建议路径**：`GraphDecoder.for_length(used + reserve)` 会把容量选到最近的桶
+（`decode.bucket_for`），于是"预留 18432 只用 2048"这种浪费在调用侧就消失了。
+
 跑法（同轮内交替，两遍取小值）：
     & .\.venv\Scripts\python.exe -u src\diagnostics\probe_decode_maxlen.py
 """
@@ -58,9 +61,10 @@ def main() -> None:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description="decode 耗时 vs used vs max_len")
     ap.add_argument("--used", type=int, nargs="+", default=[2048, 7291])
-    ap.add_argument("--max-len", type=int, nargs="+", default=[2070, 7323, 18432])
+    ap.add_argument("--max-len", type=int, nargs="+", default=[2070, 4096, 7323, 8192, 18432])
     ap.add_argument("--reps", type=int, default=6)
     ap.add_argument("--rounds", type=int, default=2)
+    ap.add_argument("--reserve", type=int, default=24, help="给生成 token 留的余量（选桶用）")
     args = ap.parse_args()
 
     nova, tok = load_bundle(1, "triton")
@@ -98,6 +102,22 @@ def main() -> None:
 
     print("\n判据：若耗时只随 max_len 变、几乎不随 used 变 -> decode 被「读满 max_len 槽位」卡住，"
           "而不是被真实上下文长度卡住。")
+
+    from nova.decode import bucket_for
+
+    widest = max(args.max_len)
+    print(f"\n=== 建议路径（P0）：for_length(used + {args.reserve}) 选桶 ===")
+    print(f"{'used':>6s} {'选中的桶':>9s} {'ms/token':>9s}  与 max_len={widest} 相比")
+    for used in sorted(args.used):
+        b = bucket_for(used + args.reserve)
+        key = (used, b)
+        if key not in best:
+            print(f"{used:>6d} {b:>9d} {'未测':>9s}  （把 {b} 加进 --max-len 再跑）")
+            continue
+        ref = best.get((used, widest))
+        cut = f"省 {100 * (1 - best[key] / ref):.1f}%" if ref else "—"
+        print(f"{used:>6d} {b:>9d} {best[key]:>9.1f}  {cut}")
+    print("（选桶只改'读多少槽位'，不改结果：tests/test_decode_mask_bucket.py 逐 token 对照过）")
     print(f"clocks.sm {clock_sm()}")
 
 
