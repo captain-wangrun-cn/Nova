@@ -10,12 +10,12 @@
 | 项 | 状态 |
 |------|------|
 | 设计文档 | ✅ **16 份，3359 行**（`docs/01` ~ `docs/16`） |
-| 决策 | ✅ **34 条**（`docs/13-decisions.md`）；D19 待定，D21/D22 已被 D23/D24 取代，**D26 技术归因已被 D27 更正**，**D30 取代 D29 第 2 条的路径排序**，**D32 更正 D31 的解读**，**D33 补充 D28 的成立条件**；新增 D31（S4 记忆最小实现）、D32（S4 对照实验）、D33（长上下文注意力）、**D34（KV int4 量化：精度无退化，但 3.46x 收益未到手）** |
+| 决策 | ✅ **35 条**（`docs/13-decisions.md`）；D19 待定，D21/D22 已被 D23/D24 取代，**D26 技术归因已被 D27 更正**，**D30 取代 D29 第 2 条的路径排序**，**D32 更正 D31 的解读**，**D33 补充 D28 的成立条件**；新增 D31（S4 记忆最小实现）、D32（S4 对照实验）、D33（长上下文注意力）、D34（KV int4 量化：精度无退化，但 3.46x 收益未到手）、**D35（拆 O(n²) 掩码表 + 容量分桶：decode 少搬 48–60%，并推翻"重捕爆显存"）** |
 | 教师选型 | ✅ **已冻结（v4 七层，D24）**，S5 直接执行，不要重新调研 |
-| 代码 | ✅ **S0-S4 全部完成 + 速度路径 ①/② + KV int4 测量**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码 + 4-bit lm_head + L0 记忆 `memory.py` + **KV 量化 `kvquant.py`**）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、**`src/s4_memory_demo.py`**、`tests/`（**54 passed**）、`src/bench_nova.py`、`src/bench_graph.py`、`src/bench_memory.py`、`src/diagnostics/`（速度归因 + 记忆诊断 + KV 量化诊断脚本） |
+| 代码 | ✅ **S0-S4 全部完成 + 速度路径 ①/② + KV int4 测量 + P0 解码分桶**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码（**分桶：`BUCKETS`/`for_length`/`grow`**）+ 4-bit lm_head + L0 记忆 `memory.py` + KV 量化 `kvquant.py`）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、**`src/s4_memory_demo.py`**、`tests/`（**60 passed**）、`src/bench_nova.py`、`src/bench_graph.py`、`src/bench_memory.py`、`src/diagnostics/`（速度归因 + 记忆诊断 + KV 量化诊断 + **重捕/分桶诊断**） |
 | 环境 | ✅ torch 2.6.0+cu124 + 权重 **8.89 GB 已缓存**（`.hf-cache`）；基线 4-bit 峰值 **2.79 GiB**；**Nova 单通路图解码 14.0 ms/token（71.3 tok/s，3.28 GiB）/ 双通路 22.7 ms/token（44.0 tok/s，4.83 GiB）** |
 | 代码托管 | ✅ **<https://github.com/captain-wangrun-cn/Nova>**（**public**，默认分支 `main`）。提交规范见 [AGENTS.md](AGENTS.md) 第七节 |
-| 下一步 | **KV int4 的细尺子 + 8 位对照 + K 分组方向对照**（见第六·补三节；**先别写融合核**）；然后 **S5 · 数据与蒸馏**（里程碑 2 起点）；速度侧 **③ 融合 RoPE / 去冗余拷贝**；记忆侧见第七节"下一步优化" |
+| 下一步 | **第五轮 · 五条证伪实验 + PCIe/主机内存分层**（顺序与门控见第六·补四节）：**E1** 路由召回率（top-norm-K vs mean-K）→ **E2** 免费版滑窗（W ∈ {1024,2048,4096}；16K 全量基线 + 32K/64K 滑窗；**必测滑窗下的 S4 记忆取回**）→ **E3** 8 位 KV 对照 → **E4** 窄化 Triton 证伪（M=1 解包微基准）→ **E5** 干扰项 4/16/64 → **E6** PCIe/主机内存分层；然后 **S5 · 数据与蒸馏**（里程碑 2 起点） |
 
 **一句话：设计做完了，现在要开始证明"双通路 + 内部记忆"在 8GB 显存上真的能跑。**
 
@@ -270,6 +270,27 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 
 ---
 
+## 六·补四 · P0：拆掉 O(n²) 掩码表 + 容量分桶（✅ 2026-09-22 —— **长上下文实验的前提，解码少搬 48–60%**）
+
+**报告：[reports/decode-mask-bucket.md](reports/decode-mask-bucket.md) · 决策 D35 · 代码 `src/nova/decode.py` · 测试 `tests/test_decode_mask_bucket.py`（6 条，全套 60 passed）**
+
+**已核查：**
+
+1. **掩码整表拆掉了**：旧 `_build_mask_table` 常驻 `max_len²×2`（18432→0.63 / 32768→2.00 / 65536→**8.00 GiB**，是"上下文上限"的第一堵墙）；现在**图内即时构造一行**，常驻只剩 `8×max_len` 的 arange + 图内 `2×max_len`（65536 → **512 KiB + 128 KiB**）。**与旧表逐位一致**（测试钉住）。`_build_mask_table` 只留着做对照与核算旧体积。
+2. **容量按桶分配**（`BUCKETS = 2070/4096/8192/16384/32768/65536`、`bucket_for()`、`GraphDecoder.for_length()`、`grow()`）：decode 读量随**桶**走，不随"随手给的 `max_len`"走。`used=2048` **139.1 → 56.1 ms/token（省 59.7%）**；`used=7291` **138.7 → 71.2（省 48.6%）**（单通路 triton，同轮交替两遍取小，`clocks.sm 2460`）。**耗时的判据仍是"只随 `max_len` 走"**。
+3. **选桶与搬家都不改结果**：窄桶 vs 宽桶、`grow()` 前后，贪心 token **逐个相同**；跨桶重捕的显存增量**正好等于**多出来的 KV 容量（2026×144 KiB = 291.7 MiB / 4096×144 KiB = 576 MiB）⇒ 不漏。
+4. **"重捕就爆显存"是误判**：三种图内存池策略的逐轮 allocated 基本平。**共享池反而会踩 PyTorch 裸 assert**（`CUDACachingAllocator.cpp:2225`，只在 pytest 全量跑中触发、脚本 5 种序列复现不出）⇒ `capture()` 默认 `pool="off"`（不共享）。
+
+**没解决的（就是第五轮的门）：**
+
+- **64K 仍装不下**：fp16 KV 在 65536 是 **9.00 GiB** ⇒ 必须靠 **E2 滑窗层**。
+- decode **固定地板 ~59 ms/token**（`max_len=2070` 时 KV 只占 ~1 ms）、prefill 的 **O(n²) 算力墙**（12.7K=6.8 s → 32K≈45 s → 64K≈180 s）都没动。
+- 逐轮 **+8.1 MiB** 的缓慢增长来源未定位（**待实测**）；共享池 assert 的触发条件**推测**（依赖分配器状态），处置是默认绕开。
+
+> 第六·补三留下的三条**仍然有效**：①别把"记账收益"当"已实现收益"；②**先别写融合核**（顺序：细尺子 → 8 位 → K 分组方向 → 再谈融合核）；③记忆一律 fp16 存。
+
+---
+
 ## 七、S4 · 记忆最小实现（✅ 已完成 2026-09-22 —— **8/8 取回，跨进程可复现**）
 
 **报告：[reports/s4-memory-min.md](reports/s4-memory-min.md) · 决策 D31 · 演示 `src/s4_memory_demo.py` · 基准 `src/bench_memory.py`**
@@ -342,9 +363,9 @@ $env:HF_HUB_OFFLINE='1'; $env:TRITON_CACHE_DIR=$env:TMP+'\triton-cache'; $env:TO
 | `HANDOFF.md` | 本文件：执行顺序与交接 |
 | `README.md` | 项目总览与文档索引 |
 | `docs/01` ~ `docs/16` | 设计文档（15 愿景 / 02 架构 / 03 记忆 / 11 路线图 / 13 决策 / 15 语言 / 16 模型解剖） |
-| `src/` | 代码（S0-S4 全部完成；`nova/` 是双通路骨架 + 图解码 + L0 记忆 + **KV 量化 `kvquant.py`**，`chat.py` 交互 CLI，`diagnostics/` 是速度归因 + 记忆诊断 + **KV 量化诊断**脚本） |
-| `tests/` | 单元测试（**54 passed**：`test_nova_skeleton.py` 8 条 + `test_graph_decode.py` 4 条 + `test_nf4_linear.py` 11 条 + `test_lm_head4.py` 5 条 + `test_memory.py` 12 条 + **`test_kvquant.py` 13 条**） |
-| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / `speed-path1-nf4-gemv` / `s4-memory-min` / `long-context-attention` / **`kv-int4`**） |
+| `src/` | 代码（S0-S4 全部完成；`nova/` 是双通路骨架 + 图解码（**分桶**）+ L0 记忆 + KV 量化 `kvquant.py`，`chat.py` 交互 CLI，`diagnostics/` 是速度归因 + 记忆诊断 + KV 量化诊断 + **重捕/分桶诊断 `probe_graph_recapture.py`**） |
+| `tests/` | 单元测试（**60 passed**：`test_nova_skeleton.py` 8 条 + `test_graph_decode.py` 4 条 + `test_nf4_linear.py` 11 条 + `test_lm_head4.py` 5 条 + `test_memory.py` 12 条 + `test_kvquant.py` 13 条 + **`test_decode_mask_bucket.py` 6 条**） |
+| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / `speed-path1-nf4-gemv` / `s4-memory-min` / `long-context-attention` / `kv-int4` / **`decode-mask-bucket`**） |
 | `data/` | 评测集、训练数据（待建，**放 H 盘更大的话用软链接**） |
 | `models/` | 本地权重（建议只放软链接，实体在 `H:\hf-cache`） |
 
