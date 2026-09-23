@@ -53,13 +53,6 @@ $env:TMP           = 'H:\tmp'
 
 > 不设 HF_HOME，模型会下到 `C:\Users\18889\.cache\huggingface`（约 9GB），**直接把 C 盘塞爆**。
 
-## 五、写文件的方法
-
-**直接用 `apply_patch` 工具**（`*** Add File:` / `*** Update File:` / `*** Delete File:`）。
-中文内容没有问题，不需要任何绕行脚本。
-
-- 新增文件用 `*** Add File: 路径`，正文每行以 `+` 开头。
-- 改已有文件用 `*** Update File: 路径`，`@@` 上下文 + `-`/`+` 标注增删；改完**不要**再读一遍文件确认（失败会报错）。
 - 联网受限：访问 Hugging Face / PyPI 若失败，请用 `require_escalated` 重新发起。
 - 中国大陆网络可试镜像：`$env:HF_ENDPOINT = 'https://hf-mirror.com'`。
 

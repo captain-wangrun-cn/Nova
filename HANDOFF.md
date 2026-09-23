@@ -15,7 +15,7 @@
 | 代码 | ✅ **S0-S4 全部完成 + 速度路径 ①/② + KV int4 测量 + P0 解码分桶**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码（**分桶：`BUCKETS`/`for_length`/`grow`**）+ 4-bit lm_head + L0 记忆 `memory.py` + KV 量化 `kvquant.py`）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、**`src/s4_memory_demo.py`**、`tests/`（**60 passed**）、`src/bench_nova.py`、`src/bench_graph.py`、`src/bench_memory.py`、`src/diagnostics/`（速度归因 + 记忆诊断 + KV 量化诊断 + **重捕/分桶诊断**） |
 | 环境 | ✅ torch 2.6.0+cu124 + 权重 **8.89 GB 已缓存**（`.hf-cache`）；基线 4-bit 峰值 **2.79 GiB**；**Nova 单通路图解码 14.0 ms/token（71.3 tok/s，3.28 GiB）/ 双通路 22.7 ms/token（44.0 tok/s，4.83 GiB）** |
 | 代码托管 | ✅ **<https://github.com/captain-wangrun-cn/Nova>**（**public**，默认分支 `main`）。提交规范见 [AGENTS.md](AGENTS.md) 第七节 |
-| 下一步 | **第五轮**：**E1** ✅ 不 adopt → **E2** ✅ 不 adopt → **E3** ✅ 通过（改选 int8）→ **E5** ✅ 结案（尺子升级到 ≥16 条）→ **E4** 窄化 Triton 证伪（**靶子改成 int8**）→ **E6** PCIe/主机内存分层；然后 **S5 · 数据与蒸馏**（里程碑 2 起点） |
+| 下一步 | **第五轮**：**E1** ✅ 不 adopt → **E2** ✅ 不 adopt → **E3** ✅ 通过（改选 int8）→ **E5** ✅ 结案 → **E4** ✅ 通过（int8 可写核、int4 结案）→ **E6** PCIe/主机内存分层（**只剩这一条**）；然后 **S5 · 数据与蒸馏**（里程碑 2 起点） |
 
 **一句话：设计做完了，现在要开始证明"双通路 + 内部记忆"在 8GB 显存上真的能跑。**
 
@@ -326,6 +326,22 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 ---
 
 ## 七、S4 · 记忆最小实现（✅ 已完成 2026-09-22 —— **8/8 取回，跨进程可复现**）
+## 六·补九 · E4 解包微基准（✅ 2026-09-23 —— **int8 通过，int4 结案**）
+
+**报告：[reports/kv-unpack-bench.md](reports/kv-unpack-bench.md) · 决策 D40 · 脚本 `src/diagnostics/bench_int8_unpack.py`（不用加载模型，几秒出结果）**
+
+| 模式 | 每次读 | 有效带宽 | 相对 232.5 GiB/s 上限 | 同一份 KV 的耗时 vs fp16 |
+|---|---:|---:|---:|---:|
+| `fp16`（基线） | 0.125 GiB | 230.9 GiB/s | 99.3% | 1.00x |
+| **`int8`** | 0.070 GiB | **200.5 GiB/s** | **86.3%** | **0.65x（快 1.54x）** |
+| `int4`（打包） | 0.039 GiB | **53.4 GiB/s** | **23.0%** | **1.35x（更慢）** |
+
+- **int8 通过判据（≥50%）**，五组 block/warps 稳定在 85.5–86.3% ⇒ **可以写融合核，靶子是 int8**。
+- **int4 触发结案判据（<25%）**，且 block 越大越差（16.3–23.6%）⇒ 瓶颈在 nibble 解包的 ALU，
+  **省下的带宽被吃光还倒亏**（D30 的教训重演）。int4 只留作存储格式。
+- 待实测：完整 attention 核（online softmax + GQA 广播 + causal）—— 本实验只证明"访存+反量化"这段不拖后腿。
+
+---
 ## 六·补七 · E3 8 位 KV（✅ 2026-09-23 —— **通过，改选 int8**）
 
 **报告：[reports/kv-quant-8bit.md](reports/kv-quant-8bit.md) · 决策 D38 · 探针 `src/diagnostics/probe_kvquant_bits.py` · 测试 `tests/test_kvquant.py`（19 条）**
