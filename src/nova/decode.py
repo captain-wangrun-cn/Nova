@@ -29,7 +29,7 @@ import weakref
 import torch
 import torch.nn.functional as F
 
-from .cache import StaticKVCache
+from .cache import StaticKVCache, WindowedKVCache
 
 # ---- 容量分桶 ----
 
@@ -111,15 +111,35 @@ class GraphDecoder:
         self.device = device
         self.dtype = dtype
 
-        self.cache = StaticKVCache(
-            num_slots=self.text.num_cache_layers,
-            num_kv_heads=self.cfg.num_key_value_heads,
-            head_dim=self.cfg.head_dim,
-            max_len=max_len,
-            batch=batch,
-            dtype=dtype,
-            device=device,
-        )
+        # 滑动窗口（E2）：`swa_window > 0` 时局部层只用 **2W** 个槽（ring），全局层仍按 max_len。
+        self.swa_window = int(getattr(self.cfg, "swa_window", 0) or 0)
+        self.swa_chunk = int(getattr(self.cfg, "swa_chunk", 0) or 0) or self.swa_window
+        if self.swa_window and self.swa_chunk > self.swa_window:
+            raise ValueError(f"prefill 分块 {self.swa_chunk} 不能大于窗口 {self.swa_window}（ring 装不下）")
+        self.layer_windows = list(self.text.layer_windows)
+        self.window_slots = 2 * self.swa_window if self.swa_window else 0
+        if self.swa_window:
+            self.cache = WindowedKVCache(
+                capacities=[2 * w if w else max_len for w in self.layer_windows],
+                num_kv_heads=self.cfg.num_key_value_heads,
+                head_dim=self.cfg.head_dim,
+                max_len=max_len,
+                batch=batch,
+                dtype=dtype,
+                device=device,
+            )
+            self._win_arange = torch.arange(self.window_slots, dtype=torch.long, device=device)
+        else:
+            self.cache = StaticKVCache(
+                num_slots=self.text.num_cache_layers,
+                num_kv_heads=self.cfg.num_key_value_heads,
+                head_dim=self.cfg.head_dim,
+                max_len=max_len,
+                batch=batch,
+                dtype=dtype,
+                device=device,
+            )
+            self._win_arange = None
         self.input_ids = torch.zeros(batch, 1, dtype=torch.long, device=device)
         # ⚠️ 不再分配 `(max_len, max_len)` 的掩码表。只留一份 arange 与两个 0 维标量，
         # 掩码在 `_mask_row()` 里即时构造 —— 形状恒定，图内安全，与旧表逐位一致。
@@ -163,6 +183,21 @@ class GraphDecoder:
         """
         return torch.where(self._arange <= pos, self._zero, self._ninf).view(1, 1, 1, self.max_len)
 
+    def _window_mask(self, q_start, n: int) -> torch.Tensor:
+        """**局部层**的加性掩码，形状 `(1,1,n,2W)`，列按 ring 的**存储序**排列。
+
+        槽位 `i` 的绝对位置 `p_i = end - ((end - i) % cap)`（`end` = 最后一个写入位置）。
+        有效 = 写过（`p_i >= first`）且 `p_i <= q` 且 `q - p_i < W`。
+
+        存储序不需要重排：注意力是对 key 集合求和，集合对了顺序无所谓。
+        """
+        end = q_start + (n - 1)
+        p = end - torch.remainder(end - self._win_arange, self.window_slots)  # [2W]
+        q = torch.arange(n, device=p.device, dtype=torch.long) + q_start       # [n]
+        pr, qr = p.view(1, -1), q.view(-1, 1)
+        valid = (pr >= self.cache.first) & (pr <= qr) & ((qr - pr) < self.swa_window)
+        return torch.where(valid, self._zero, self._ninf).view(1, 1, n, self.window_slots)
+
     # ---- eager prefill ----
 
     @torch.inference_mode()
@@ -192,17 +227,36 @@ class GraphDecoder:
         if n + offset > self.max_len:
             raise ValueError(f"prompt 长度 {n} + 起点 {offset} 超过 max_len {self.max_len}")
         self.cache.pos.fill_(offset)
-        if offset:
-            rows = torch.arange(offset, offset + n, device=self.cache.pos.device)
-            keep = self._arange.view(1, 1, 1, -1) <= rows.view(1, 1, n, 1)
-            mask = torch.where(keep, self._zero, self._ninf)
+        if self.swa_window:
+            # ring 的掩码靠 `first` 判断"哪些槽还没写过"；全长 cache 不需要。
+            # ⚠️ **取 min，不能直接覆盖**：S4 的记忆注入是"先写前缀 -> 再从 offset 继续 prefill"，
+            # 若这里把 first 覆盖成 offset，第二次 prefill 之后局部层会把 `[0, offset)` 全判成
+            # "没写过"，窗口里只剩当前这一小段 —— 实测表现是**所有问题都答不出来**（0/4）。
+            self.cache.first.fill_(min(int(self.cache.first.item()), offset))
+        # 滑动窗口开启时**必须分块**：局部层的 ring 只有 2W 个槽，一次写 n > 2W 会互相覆盖。
+        # 分块大小取 W（== 窗口），这样"上一块的尾巴 + 本块" ≤ 2W，局部层看得见它需要的一切。
+        chunk = self.swa_chunk if self.swa_window else n
+        out = None
+        for c0 in range(0, n, chunk):
+            nc = min(chunk, n - c0)
+            off = offset + c0
+            self.cache.pos.fill_(off)
+            # 非 0 起点、或开了滑窗（第 2 块起必然非 0 起点）时都要显式掩码：
+            # 不能走 `is_causal` 那条路（它把 kv 截断到前 n 个槽位 = 前缀）。
+            if off or self.swa_window:
+                rows = torch.arange(off, off + nc, device=self.cache.pos.device)
+                keep = self._arange.view(1, 1, 1, -1) <= rows.view(1, 1, nc, 1)
+                mask = torch.where(keep, self._zero, self._ninf)
+            else:
+                mask = None
+            wmask = self._window_mask(off, nc) if self.swa_window else None
             out = self.model(
-                input_ids=input_ids, past_key_values=self.cache, attention_mask=mask,
-                cross_mode="off", logits_to_keep=1,
-            )
-        else:
-            out = self.model(
-                input_ids=input_ids, past_key_values=self.cache, cross_mode="off", logits_to_keep=1
+                input_ids=input_ids[:, c0 : c0 + nc],
+                past_key_values=self.cache,
+                attention_mask=mask,
+                window_mask=wmask,
+                cross_mode="off",
+                logits_to_keep=1,
             )
         # ⚠️ 必须填**第一个生成 token**，不能填最后一个 prompt token：
         # prefill 已把整个 prompt 写进 cache（位置 offset..offset+n-1），pos 指向 offset+n。
@@ -219,11 +273,13 @@ class GraphDecoder:
         pos = self.cache.pos
         position_ids = pos.view(1, 1, 1).expand(3, self.batch, 1)
         mask = self._mask_row(pos)
+        wmask = self._window_mask(pos, 1) if self.swa_window else None
         hidden = t(
             input_ids=self.input_ids,
             past_key_values=self.cache,
             position_ids=position_ids,
             attention_mask=mask,
+            window_mask=wmask,
             cross_mode="off",
         )
         logits = self.model.lm_head_forward(hidden)
@@ -233,6 +289,33 @@ class GraphDecoder:
         return logits
 
     # ---- 捕获 / 回放 ----
+
+    def _save_ring_slots(self, start: int, warmup: int):
+        """把 warmup 会覆盖到的 ring 槽位存下来（只对**局部层**）。
+
+        warmup 写的位置是 `start .. start+warmup-1`；其中 `start` 那一槽本来就还没写过
+        （下一次真实 replay 会写它），只有 `start+1 ..` 才是真的污染。
+        """
+        if not self.swa_window:
+            return []
+        out = []
+        for slot, cap in enumerate(self.cache.capacities):
+            if cap >= self.max_len:
+                continue
+            idx = [int((start + j) % cap) for j in range(1, warmup)]
+            if not idx:
+                continue
+            t = torch.tensor(idx, device=self.cache.pos.device)
+            out.append((slot, idx,
+                        self.cache.key_cache[slot][:, :, t, :].clone(),
+                        self.cache.value_cache[slot][:, :, t, :].clone()))
+        return out
+
+    def _restore_ring_slots(self, saved) -> None:
+        for slot, idx, kk, vv in saved:
+            t = torch.tensor(idx, device=self.cache.pos.device)
+            self.cache.key_cache[slot][:, :, t, :] = kk
+            self.cache.value_cache[slot][:, :, t, :] = vv
 
     def capture(self, warmup: int = 3, pool: str | object = "off") -> None:
         """捕获。调用前必须先 `prefill()`（`pos` 决定图的起始位置）。
@@ -257,6 +340,10 @@ class GraphDecoder:
         self.model.eval()
         start = int(self.cache.pos.item())
         saved_ids = self.input_ids.clone()
+        # ⚠️ warmup 会**原地写** `warmup` 个位置。全长槽位无所谓（它们在 `pos` 之后，被掩码挡掉），
+        # 但 ring 槽位会**覆盖掉窗口内的老 token**（槽 i 装的是"最近一次写到 i 的 token"，
+        # 而掩码只认位置、不认内容）⇒ 必须先把要被动的那几个槽存下来，warmup 后写回。
+        saved_ring = self._save_ring_slots(start, warmup)
 
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
@@ -270,6 +357,7 @@ class GraphDecoder:
         # warmup 把 pos 推进了 warmup 步，复位到起点
         self.cache.pos.fill_(start)
         self.input_ids.copy_(saved_ids)
+        self._restore_ring_slots(saved_ring)
 
         g = torch.cuda.CUDAGraph()
         if pool == "off":
@@ -300,19 +388,38 @@ class GraphDecoder:
         if new_max_len <= self.max_len:
             return
         used = int(self.cache.pos.item())
+        first = int(self.cache.first.item()) if hasattr(self.cache, "first") else 0
         old = self.cache
-        new = StaticKVCache(
-            num_slots=old.num_slots,
-            num_kv_heads=self.cfg.num_key_value_heads,
-            head_dim=self.cfg.head_dim,
-            max_len=new_max_len,
-            batch=self.batch,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        for i in range(new.num_slots):
-            new.key_cache[i][:, :, :used] = old.key_cache[i][:, :, :used]
-            new.value_cache[i][:, :, :used] = old.value_cache[i][:, :, :used]
+        if self.swa_window:
+            # 局部层的容量（2W）**不随 max_len 变**，所以它们的 ring 布局原样搬过去；
+            # 只有全局层的容量变。`pos` / `first` 必须一起带过去，否则 ring 的位置公式会错。
+            new = WindowedKVCache(
+                capacities=[2 * w if w else new_max_len for w in self.layer_windows],
+                num_kv_heads=self.cfg.num_key_value_heads,
+                head_dim=self.cfg.head_dim,
+                max_len=new_max_len,
+                batch=self.batch,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            for i in range(new.num_slots):
+                n = min(used, new.capacities[i])
+                new.key_cache[i][:, :, :n] = old.key_cache[i][:, :, :n]
+                new.value_cache[i][:, :, :n] = old.value_cache[i][:, :, :n]
+            new.first.fill_(first)
+        else:
+            new = StaticKVCache(
+                num_slots=old.num_slots,
+                num_kv_heads=self.cfg.num_key_value_heads,
+                head_dim=self.cfg.head_dim,
+                max_len=new_max_len,
+                batch=self.batch,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            for i in range(new.num_slots):
+                new.key_cache[i][:, :, :used] = old.key_cache[i][:, :, :used]
+                new.value_cache[i][:, :, :used] = old.value_cache[i][:, :, :used]
         new.pos.fill_(used)
         self.cache = new
         self.max_len = new_max_len

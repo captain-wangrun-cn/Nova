@@ -35,6 +35,24 @@ def bundle():
     nova, hf, tok = load_nova(norm_impl="exact")
     return nova, hf, tok
 
+@pytest.fixture(scope="session")
+def nova_swa(bundle):
+    """按需**重挂**一层 Nova 外壳（`swa_window` 可配）。
+
+    复用同一个 HF 基座对象（`build_nova` 直接引用它的层），所以几乎不额外吃显存 ——
+    这条很重要：再 `load_nova()` 一次会多占 ~2.5 GiB，8 GB 装不下。
+    """
+    _, hf, _ = bundle
+    from nova.loader import build_nova
+
+    def make(window: int, chunk: int = 0, num_paths: int = 1, **kw):
+        # ⚠️ 必须显式 `num_paths`：`build_nova` 的默认是**双通路**，那会 deepcopy 24 个通路层
+        # （每次调用 +2.4 GiB）—— 在 8 GB 上再建一个双通路模型直接 OOM（实测踩过）。
+        return build_nova(hf, norm_impl="exact", num_paths=num_paths,
+                          swa_window=window, swa_chunk=chunk, **kw)
+
+    return make
+
 
 @pytest.fixture(scope="session")
 def prompt_ids(bundle):

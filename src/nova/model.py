@@ -43,7 +43,9 @@ class NovaTextModel(nn.Module):
         pfx, npath, nlay = config.num_prefix_layers, config.num_paths, config.num_path_layers
 
         self.prefix_layers = nn.ModuleList(
-            LeanDecoderLayer(hf_layers[i], config, self.cache_slot_prefix(i), norm_impl) for i in config.prefix_range
+            LeanDecoderLayer(hf_layers[i], config, self.cache_slot_prefix(i), norm_impl,
+                             window=config.window_for_layer(i))
+            for i in config.prefix_range
         )
 
         # 通路 0 复用 HF 原层（同一份权重）；通路 1..N-1 深拷贝 —— 这才是双通路的真实显存代价
@@ -53,12 +55,14 @@ class NovaTextModel(nn.Module):
             for i in range(nlay):
                 src = hf_layers[pfx + i]
                 hf_layer = src if p == 0 else copy.deepcopy(src)
-                per_path.append(LeanDecoderLayer(hf_layer, config, self.cache_slot_path(p, i), norm_impl))
+                per_path.append(LeanDecoderLayer(hf_layer, config, self.cache_slot_path(p, i), norm_impl,
+                                                 window=config.window_for_layer(pfx + i)))
             path_layers.append(nn.ModuleList(per_path))
         self.path_layers = nn.ModuleList(path_layers)
 
         self.suffix_layers = nn.ModuleList(
-            LeanDecoderLayer(hf_layers[j], config, self.cache_slot_suffix(j - config.suffix_range.start), norm_impl)
+            LeanDecoderLayer(hf_layers[j], config, self.cache_slot_suffix(j - config.suffix_range.start), norm_impl,
+                             window=config.window_for_layer(j))
             for j in config.suffix_range
         )
 
@@ -89,6 +93,22 @@ class NovaTextModel(nn.Module):
     def num_cache_layers(self) -> int:
         return self.config.num_prefix_layers + self.config.num_paths * self.config.num_path_layers + self.config.num_suffix_layers
 
+    @property
+    def layer_windows(self) -> list[int]:
+        """每个 cache 槽位的注意力窗口（0 = 全局层）。给 `WindowedKVCache` 定容量用。
+
+        层号用**变换器层号**：两条通路的同一个变换器层拿到同一个窗口 —— 否则两条路的表示会分叉。
+        """
+        out = [0] * self.num_cache_layers
+        for i in self.config.prefix_range:
+            out[self.cache_slot_prefix(i)] = self.config.window_for_layer(i)
+        for p in range(self.config.num_paths):
+            for i in range(self.config.num_path_layers):
+                out[self.cache_slot_path(p, i)] = self.config.window_for_layer(self.config.num_prefix_layers + i)
+        for j in self.config.suffix_range:
+            out[self.cache_slot_suffix(j - self.config.suffix_range.start)] = self.config.window_for_layer(j)
+        return out
+
     # ---- 前向 ----
 
     def forward(
@@ -97,6 +117,7 @@ class NovaTextModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        window_mask: torch.Tensor | None = None,
         past_key_values: Any = None,
         cross_mode: str = "off",
         return_paths: bool = False,
@@ -121,13 +142,15 @@ class NovaTextModel(nn.Module):
         position_embeddings = self.rotary_emb(hidden, position_ids)
 
         for layer in self.prefix_layers:
-            hidden = layer(hidden, position_embeddings, attention_mask, past_key_values)
+            hidden = layer(hidden, position_embeddings, attention_mask, window_mask, past_key_values)
 
         paths = [hidden] * self.config.num_paths if self.config.num_paths == 1 else [hidden, hidden.clone()]
 
         for i in range(self.config.num_path_layers):
             paths = [
-                self.path_layers[p][i](paths[p], position_embeddings, attention_mask, past_key_values)
+                self.path_layers[p][i](
+                    paths[p], position_embeddings, attention_mask, window_mask, past_key_values
+                )
                 for p in range(self.config.num_paths)
             ]
             if i in self.cross_indices:
@@ -137,7 +160,7 @@ class NovaTextModel(nn.Module):
         hidden = paths[0] if len(paths) == 1 else torch.stack(paths, dim=0).mean(dim=0)
 
         for layer in self.suffix_layers:
-            hidden = layer(hidden, position_embeddings, attention_mask, past_key_values)
+            hidden = layer(hidden, position_embeddings, attention_mask, window_mask, past_key_values)
 
         hidden = self.norm(hidden)
         return (hidden, path_states) if return_paths else hidden

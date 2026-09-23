@@ -39,6 +39,17 @@ class NovaConfig:
     # 预测编码门控：预测器隐藏维（新增参数）
     gate_hidden: int = 256
 
+    # ---- 滑动窗口注意力（E2，见 reports/swa-window.md）----
+    # `swa_window = 0` ⇒ 关闭（每层都看全上下文，= 现在的行为）。
+    # > 0 时：层号能被 `swa_global_every` 整除的是**全局层**，其余是**局部层**（只看最近 `swa_window` 个 token）。
+    # 层号用**变换器层号**（前缀 i / 通路 prefix+i / 后缀 j），不是 cache 槽位号 ——
+    # 双通路的两条路必须用同一套窗口，否则两条路的表示会漂。
+    swa_window: int = 0
+    swa_global_every: int = 4
+    # prefill 的分块大小（0 = 取 `swa_window`）。**必须 ≤ swa_window**：
+    # 局部层的 ring 只有 2W 个槽，"上一块的尾巴 + 本块" ≤ 2W 才装得下。
+    swa_chunk: int = 0
+
     def __post_init__(self) -> None:
         if self.num_prefix_layers + self.num_suffix_layers >= self.num_hidden_layers:
             raise ValueError("prefix + suffix 层数必须小于总层数，否则没有可复制的中间层")
@@ -89,6 +100,17 @@ class NovaConfig:
         例：num_path_layers=24, cross_every=4 → [0, 4, 8, 12, 16, 20]
         """
         return list(range(0, self.num_path_layers, self.cross_every))
+
+    def window_for_layer(self, t_idx: int) -> int:
+        """变换器层 `t_idx` 的注意力窗口（0 = 全局层 / 关闭）。
+
+        `t_idx` 是**变换器层号**：前缀 `0..5`、通路层 `prefix+i`、后缀 `prefix+path+j`。
+        两条通路的同一个 `t_idx` 拿到同一个窗口 —— 否则两条路的表示空间会分叉。
+        """
+        if not self.swa_window:
+            return 0
+        every = max(1, int(self.swa_global_every))
+        return 0 if int(t_idx) % every == 0 else int(self.swa_window)
 
     # ---- 构造 ----
 

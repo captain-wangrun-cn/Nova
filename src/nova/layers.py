@@ -46,9 +46,19 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class LeanAttention(nn.Module):
-    def __init__(self, hf_attn: nn.Module, config: NovaConfig, layer_idx: int, norm_impl: str = "exact") -> None:
+    def __init__(
+        self,
+        hf_attn: nn.Module,
+        config: NovaConfig,
+        layer_idx: int,
+        norm_impl: str = "exact",
+        window: int = 0,
+    ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        # 滑动窗口（E2）：0 = 全局层（看全上下文）。> 0 时本层只看最近 `window` 个 token，
+        # 掩码由 `GraphDecoder` 通过 `window_mask` 传进来（形状与 cache 里本层的槽位数一致）。
+        self.window = int(window)
         self.head_dim = config.head_dim
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = config.head_dim ** -0.5
@@ -91,6 +101,7 @@ class LeanAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
+        window_mask: torch.Tensor | None = None,
         past_key_values: Any = None,
     ) -> torch.Tensor:
         input_shape = hidden_states.shape[:-1]
@@ -126,13 +137,15 @@ class LeanAttention(nn.Module):
                 value = repeat_kv(value, self.num_key_value_groups)
 
         q_len, kv_len = query.shape[2], key.shape[2]
-        is_causal = q_len > 1 and attention_mask is None and self.is_causal
+        # 局部层改用窗口掩码（它的列数与本层 ring 的槽位数一致，不是 `max_len`）
+        mask = window_mask if self.window else attention_mask
+        is_causal = q_len > 1 and mask is None and self.is_causal
         if is_causal and kv_len > q_len:
             key = key[:, :, :q_len, :]
             value = value[:, :, :q_len, :]
 
         attn_output = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, scale=self.scaling,
+            query, key, value, attn_mask=mask, dropout_p=0.0, scale=self.scaling,
             is_causal=is_causal, **sdpa_kwargs,
         )
         attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
@@ -154,10 +167,17 @@ class LeanMLP(nn.Module):
 class LeanDecoderLayer(nn.Module):
     """单条通路里的一层。"""
 
-    def __init__(self, hf_layer: nn.Module, config: NovaConfig, layer_idx: int, norm_impl: str = "exact") -> None:
+    def __init__(
+        self,
+        hf_layer: nn.Module,
+        config: NovaConfig,
+        layer_idx: int,
+        norm_impl: str = "exact",
+        window: int = 0,
+    ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
-        self.self_attn = LeanAttention(hf_layer.self_attn, config, layer_idx, norm_impl)
+        self.self_attn = LeanAttention(hf_layer.self_attn, config, layer_idx, norm_impl, window)
         self.mlp = LeanMLP(hf_layer.mlp, config)
         self.input_layernorm = LeanRMSNorm.from_hf(hf_layer.input_layernorm, norm_impl)
         self.post_attention_layernorm = LeanRMSNorm.from_hf(hf_layer.post_attention_layernorm, norm_impl)
@@ -167,6 +187,7 @@ class LeanDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
+        window_mask: torch.Tensor | None = None,
         past_key_values: Any = None,
         **kwargs: Any,
     ) -> torch.Tensor:
@@ -176,6 +197,7 @@ class LeanDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
+            window_mask=window_mask,
             past_key_values=past_key_values,
         )
         hidden_states = residual + hidden_states
