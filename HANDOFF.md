@@ -325,23 +325,6 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 
 ---
 
-## 七、S4 · 记忆最小实现（✅ 已完成 2026-09-22 —— **8/8 取回，跨进程可复现**）
-## 六·补九 · E4 解包微基准（✅ 2026-09-23 —— **int8 通过，int4 结案**）
-
-**报告：[reports/kv-unpack-bench.md](reports/kv-unpack-bench.md) · 决策 D40 · 脚本 `src/diagnostics/bench_int8_unpack.py`（不用加载模型，几秒出结果）**
-
-| 模式 | 每次读 | 有效带宽 | 相对 232.5 GiB/s 上限 | 同一份 KV 的耗时 vs fp16 |
-|---|---:|---:|---:|---:|
-| `fp16`（基线） | 0.125 GiB | 230.9 GiB/s | 99.3% | 1.00x |
-| **`int8`** | 0.070 GiB | **200.5 GiB/s** | **86.3%** | **0.65x（快 1.54x）** |
-| `int4`（打包） | 0.039 GiB | **53.4 GiB/s** | **23.0%** | **1.35x（更慢）** |
-
-- **int8 通过判据（≥50%）**，五组 block/warps 稳定在 85.5–86.3% ⇒ **可以写融合核，靶子是 int8**。
-- **int4 触发结案判据（<25%）**，且 block 越大越差（16.3–23.6%）⇒ 瓶颈在 nibble 解包的 ALU，
-  **省下的带宽被吃光还倒亏**（D30 的教训重演）。int4 只留作存储格式。
-- 待实测：完整 attention 核（online softmax + GQA 广播 + causal）—— 本实验只证明"访存+反量化"这段不拖后腿。
-
----
 ## 六·补七 · E3 8 位 KV（✅ 2026-09-23 —— **通过，改选 int8**）
 
 **报告：[reports/kv-quant-8bit.md](reports/kv-quant-8bit.md) · 决策 D38 · 探针 `src/diagnostics/probe_kvquant_bits.py` · 测试 `tests/test_kvquant.py`（19 条）**
@@ -372,6 +355,8 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 - 判据升级：**以后"是否损伤检索"一律在 ≥16 条干扰下判**。
 
 ---
+
+## 七、S4 · 记忆最小实现（✅ 已完成 2026-09-22 —— **8/8 取回，跨进程可复现**）
 
 **报告：[reports/s4-memory-min.md](reports/s4-memory-min.md) · 决策 D31 · 演示 `src/s4_memory_demo.py` · 基准 `src/bench_memory.py`**
 
@@ -445,7 +430,7 @@ $env:HF_HUB_OFFLINE='1'; $env:TRITON_CACHE_DIR=$env:TMP+'\triton-cache'; $env:TO
 | `docs/01` ~ `docs/16` | 设计文档（15 愿景 / 02 架构 / 03 记忆 / 11 路线图 / 13 决策 / 15 语言 / 16 模型解剖） |
 | `src/` | 代码（S0-S4 全部完成；`nova/` 是双通路骨架 + 图解码（**分桶**）+ **滑动窗口 `WindowedKVCache`** + L0 记忆 + KV 量化 `kvquant.py`，`chat.py` 交互 CLI，`diagnostics/` 是速度归因 + 记忆诊断 + KV 量化诊断 + 分桶/重捕诊断 + **路由/滑窗实验（`probe_memory_routing.py` / `exp_swa.py` / `probe_swa_memory.py`）**） |
 | `tests/` | 单元测试（**66 passed**：`test_nova_skeleton.py` 9 条 + `test_graph_decode.py` 4 条 + `test_nf4_linear.py` 11 条 + `test_lm_head4.py` 5 条 + `test_memory.py` 12 条 + `test_kvquant.py` 13 条 + `test_decode_mask_bucket.py` 6 条 + **`test_swa.py` 6 条**） |
-| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / `speed-path1-nf4-gemv` / `s4-memory-min` / `long-context-attention` / `kv-int4` / `decode-mask-bucket` / `memory-routing` / `swa-window` / **`kv-quant-8bit`** / **`interference-scan`**） |
+| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / `speed-path1-nf4-gemv` / `s4-memory-min` / `long-context-attention` / `kv-int4` / `decode-mask-bucket` / `memory-routing` / `swa-window` / `kv-quant-8bit` / `interference-scan` / **`kv-unpack-bench`**） |
 | `data/` | 评测集、训练数据（待建，**放 H 盘更大的话用软链接**） |
 | `models/` | 本地权重（建议只放软链接，实体在 `H:\hf-cache`） |
 
