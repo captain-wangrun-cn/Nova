@@ -24,6 +24,11 @@ import torch
 
 from nova.kvquant import (
     GROUP_K,
+    bytes_per_token,
+    dequantize_int8,
+    quantize_int8,
+    roundtrip_fp8,
+    roundtrip_int8,
     NIBBLE_MAX,
     bytes_per_token,
     dequantize_int4,
@@ -205,3 +210,75 @@ def test_cache_residual_window_keeps_tail_fp16():
     assert torch.equal(qk[0, :, 3:5, :], k[0, :, 3:5, :])  # 最近 2 个原样
     assert not torch.equal(qk[0, :, :3, :], k[0, :, :3, :])  # 前面那些被量化过
     assert torch.equal(qk[0, :, 5:, :], torch.zeros_like(qk[0, :, 5:, :]))  # 后面还没写
+
+
+# ---------------------------------------------------------------- 8 位（E3）
+
+
+def _outlier_kv(n_tokens: int = 256, dim: int = HEAD_DIM):
+    """带**通道级离群**的 K/V（模拟实测里第 0 层 65x 那种）：第 7 通道整体放大 40x。"""
+    g = torch.Generator().manual_seed(7)
+    x = torch.randn(1, 2, n_tokens, dim, generator=g, dtype=torch.float16)
+    x[:, :, :, 7] *= 40
+    return x
+
+
+def test_int8_error_far_below_int4():
+    """判据：int8 的相对误差要**远小于** int4（文献说 8 位几乎无损）。"""
+    x = _outlier_kv()
+    e4 = (roundtrip_int4(x, GROUP_K).float() - x.float()).norm() / x.float().norm()
+    e8 = (roundtrip_int8(x, GROUP_K, "channel").float() - x.float()).norm() / x.float().norm()
+    assert float(e8) < float(e4) / 5, f"int8 {float(e8):.4f} 没比 int4 {float(e4):.4f} 好 5 倍"
+    assert float(e8) < 0.02, f"int8 相对 L2 误差 {float(e8):.4f} 偏大"
+
+
+def test_int8_token_axis_handles_channel_outlier():
+    """**按 token 维分组**（每通道一条跨 token 的尺子）应当比按通道分组更能扛通道级离群。"""
+    x = _outlier_kv()
+    e_chan = (roundtrip_int8(x, GROUP_K, "channel").float() - x.float()).norm() / x.float().norm()
+    e_tok = (roundtrip_int8(x, 64, "token").float() - x.float()).norm() / x.float().norm()
+    assert float(e_tok) <= float(e_chan), f"token 维 {float(e_tok):.4f} 不比 channel 维 {float(e_chan):.4f} 好"
+
+
+def test_int8_constant_exact_and_shapes():
+    """常量张量无损；两个方向的形状都回到原样。"""
+    const = torch.full((1, 2, 8, HEAD_DIM), 3.5, dtype=torch.float16)
+    for axis, gs in (("channel", GROUP_K), ("token", 4)):
+        q, mins, steps = quantize_int8(const, gs, axis)
+        assert q.shape == const.shape, f"{axis} 方向形状不对：{tuple(q.shape)}"
+        assert torch.equal(dequantize_int8(q, mins, steps, gs, axis), const)
+
+
+def test_fp8_per_token_beats_per_tensor_with_outlier():
+    """有通道级离群时，per-token scale 必须明显好于 per-tensor（离群会拉低整体精度）。"""
+    x = _outlier_kv()
+    e_tok = (roundtrip_fp8(x, "token").float() - x.float()).norm() / x.float().norm()
+    e_ten = (roundtrip_fp8(x, "tensor").float() - x.float()).norm() / x.float().norm()
+    assert float(e_tok) < float(e_ten), f"per-token {float(e_tok):.4f} 没比 per-tensor {float(e_ten):.4f} 好"
+    assert float(e_tok) < 0.03
+
+
+def test_bytes_accounting_8bit():
+    """记账：int8 约 1.86x（判据 1.85–1.95），fp8 约 1.97x，且都远好于 int4 的 3.46x。"""
+    c8 = bytes_per_token(36, 8, 128, bits=8)
+    c8t = bytes_per_token(36, 8, 128, bits=8, k_axis="token", token_group=64)
+    cf8 = bytes_per_token(36, 8, 128, bits="fp8")
+    assert 1.85 <= c8["ratio"] <= 1.95, f"int8 ratio {c8['ratio']:.3f} 不在判据区间"
+    assert 1.85 <= c8t["ratio"] <= 1.95
+    assert cf8["ratio"] >= 1.95
+    assert abs(c8["int8_kv"] / 1024 - 77.6) < 1.0, "int8 应约 77.6 KiB/token"
+    assert c8["int8_kv"] < bytes_per_token(36, 8, 128)["int4_kv"] * 2.0
+
+
+def test_cache_supports_int8_kind():
+    """`QuantRoundTripCache(kind="int8")` 走的是 int8 往返，且尾部仍是 0。"""
+    from nova.kvquant import QuantRoundTripCache
+
+    quant = QuantRoundTripCache(
+        num_slots=1, num_kv_heads=2, head_dim=HEAD_DIM, max_len=16, kind="int8", device="cpu"
+    )
+    k, v = _kv(5)
+    qk, qv = quant.append_prefill(k, v, 0)
+    # 只比**写过的那一段**：缓存里 5..15 槽是 0（还没写），拿它们去量化会得到非 0 的小数
+    assert torch.equal(qk[:, :, :5, :], roundtrip_int8(k[:, :, :5, :], GROUP_K, "channel"))
+    assert torch.equal(qk[0, :, 5:, :], torch.zeros_like(qk[0, :, 5:, :]))

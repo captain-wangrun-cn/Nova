@@ -52,6 +52,8 @@ import torch
 GROUP_K = 32
 GROUP_V = 0  # 0 = 整条 head_dim 一组
 NIBBLE_MAX = 15
+BYTE_MAX = 255
+FP8_MAX = 448.0  # float8_e4m3fn 的最大可表示值
 
 
 def _as_groups(x: torch.Tensor, group_size: int) -> torch.Tensor:
@@ -100,14 +102,153 @@ def roundtrip_int4(x: torch.Tensor, group_size: int = GROUP_K, dtype: torch.dtyp
     return dequantize_int4(packed, mins, steps, group_size, dtype)
 
 
+# ---------------------------------------------------------------- 8 位（E3）
+#
+# 判据（reports/kv-quant-8bit.md）：误差应当**远小于** int4（int4 的 16 档 vs int8 的 256 档），
+# 而记账只比 int4 差一点（41.6 KiB/token -> 约 74 KiB/token，约 1.86x）。
+# 三个变体分别对应文献里的三种做法：
+#
+# | 变体 | 分组方向 | 对应文献 |
+# |---|---|---|
+# | `int8` + `axis="channel"` | 每 token、沿 `head_dim` 每 32 通道一组 | 与现有 int4 的 K 同构 |
+# | `int8` + `axis="token"` | 每个通道**跨 token** 分组（G 个 token 一条尺子） | llama.cpp `q4_0/q8_0` 的做法 |
+# | `fp8` | 每 token 一个 scale（或每张量一个） | vLLM / TRT-LLM 的 FP8 KV |
+
+
+def quantize_int8(x: torch.Tensor, group_size: int = GROUP_K, axis: str = "channel"):
+    """非对称 int8 量化。`x` 形状 `[..., n, dim]` -> `(uint8, mins, steps)`。
+
+    - `axis="channel"`：沿最后一维（`head_dim`）每 `group_size` 个通道一组，**每 token 独立尺子**；
+    - `axis="token"`：沿**倒数第二维**（token）每 `group_size` 个 token 一组，**每个通道一条跨 token 的尺子**
+      —— 这就是文献里"K 按 token 维分组"的做法，用来修第 0 层那种**通道级**离群。
+    """
+    if axis not in ("channel", "token"):
+        raise ValueError(f"axis 必须是 'channel' / 'token'，收到 {axis!r}")
+    xf = x.float()
+    if axis == "channel":
+        g = _as_groups(xf, group_size or xf.shape[-1])
+        xmin, xmax = g.amin(dim=-1), g.amax(dim=-1)
+        step = ((xmax - xmin) / BYTE_MAX).clamp_min(1e-8)
+        q = ((g - xmin.unsqueeze(-1)) / step.unsqueeze(-1)).round().clamp_(0, BYTE_MAX)
+        # ⚠️ 与 int4 不同：int8 不打包，必须 reshape 回**原始形状**（int4 是故意留成分组形状再打包的）
+        return q.to(torch.uint8).reshape(*xf.shape), xmin.to(torch.float16), step.to(torch.float16)
+
+    *lead, n, dim = xf.shape
+    gs = int(group_size or n)
+    pad = (-n) % gs
+    if pad:
+        # 末尾补 `pad` 个 token（复制最后一个）凑成整组；`dequantize_int8` 会把它们切掉。
+        # 不补的话 1894 这种长度直接报错，而真实序列长度本来就是任意的。
+        idx = torch.arange(n + pad, device=xf.device).clamp_(max=n - 1)
+        xf = xf.index_select(-2, idx)
+    g = xf.reshape(*lead, (n + pad) // gs, gs, dim)
+    xmin, xmax = g.amin(dim=-2), g.amax(dim=-2)  # [..., n//gs, dim]
+    step = ((xmax - xmin) / BYTE_MAX).clamp_min(1e-8)
+    q = ((g - xmin.unsqueeze(-2)) / step.unsqueeze(-2)).round().clamp_(0, BYTE_MAX)
+    return (q.to(torch.uint8).reshape(*lead, n + pad, dim)[..., :n, :],
+            xmin.to(torch.float16), step.to(torch.float16))
+
+
+def dequantize_int8(
+    q: torch.Tensor,
+    mins: torch.Tensor,
+    steps: torch.Tensor,
+    group_size: int = GROUP_K,
+    axis: str = "channel",
+    dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """`quantize_int8` 的逆运算。"""
+    if axis == "channel":
+        gs = group_size or q.shape[-1]
+        g = q.float().reshape(*q.shape[:-1], q.shape[-1] // gs, gs)
+        x = g * steps.unsqueeze(-1).float() + mins.unsqueeze(-1).float()
+        return x.reshape(*q.shape).to(dtype)
+
+    *lead, n, dim = q.shape
+    gs = int(group_size or n)
+    pad = (-n) % gs
+    qf = q.float()
+    if pad:
+        idx = torch.arange(n + pad, device=q.device).clamp_(max=n - 1)
+        qf = qf.index_select(-2, idx)
+    g = qf.reshape(*lead, (n + pad) // gs, gs, dim)
+    x = g * steps.unsqueeze(-2).float() + mins.unsqueeze(-2).float()
+    return x.reshape(*lead, n + pad, dim)[..., :n, :].to(dtype)
+
+
+def roundtrip_int8(
+    x: torch.Tensor,
+    group_size: int = GROUP_K,
+    axis: str = "channel",
+    dtype: torch.dtype = torch.float16,
+):
+    q, mins, steps = quantize_int8(x, group_size, axis)
+    return dequantize_int8(q, mins, steps, group_size, axis, dtype)
+
+
+def roundtrip_fp8(
+    x: torch.Tensor,
+    per: str = "token",
+    dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """`float8_e4m3fn` 往返：`scale = amax / 448`，量化 `x/scale`，再乘回来。
+
+    `per="token"`：每个 `(token, head)` 一个 scale（文献里 FP8 KV 的常见做法）；
+    `per="tensor"`：整张张量一个 scale（scale 开销可忽略，但离群会拉低整体精度）。
+    """
+    if per not in ("token", "tensor"):
+        raise ValueError(f"per 必须是 'token' / 'tensor'，收到 {per!r}")
+    xf = x.float()
+    if per == "tensor":
+        amax = xf.abs().amax().clamp_min(1e-8)
+        scale = (amax / FP8_MAX).clamp_min(1e-8)
+        q = (xf / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+        return (q.float() * scale).to(dtype)
+    amax = xf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+    scale = (amax / FP8_MAX).clamp_min(1e-8)
+    q = (xf / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    return (q.float() * scale).to(dtype)
+
+
+def roundtrip(x: torch.Tensor, kind: str, group_size: int = GROUP_K, dtype: torch.dtype = torch.float16):
+    """按变体名往返一次。名字与 `probe_kvquant_bits.py` / `exp_needle.py --kv` 一致。"""
+    if kind == "fp16":
+        return x
+    if kind == "int4":
+        return roundtrip_int4(x, group_size, dtype)
+    if kind == "int8":
+        return roundtrip_int8(x, group_size, "channel", dtype)
+    if kind == "int8t":
+        return roundtrip_int8(x, 0, "token", dtype)  # 0 = 整条序列一组（跨全部 token）
+    if kind == "int8t64":
+        return roundtrip_int8(x, 64, "token", dtype)
+    if kind == "fp8":
+        return roundtrip_fp8(x, "token", dtype)
+    if kind == "fp8t":
+        return roundtrip_fp8(x, "tensor", dtype)
+    raise ValueError(f"未知的量化变体 {kind!r}")
+
+
 def bytes_per_token(
     num_slots: int,
     num_kv_heads: int,
     head_dim: int,
     group_k: int = GROUP_K,
     group_v: int = GROUP_V,
+    bits: int = 4,
+    k_axis: str = "channel",
+    token_group: int = 64,
+    fp8_per: str = "token",
 ) -> dict[str, float]:
-    """每 token 的 KV 存储字节数：fp16 基线 vs int4（含 min/step 元数据）。"""
+    """每 token 的 KV 存储字节数：fp16 基线 vs 量化方案（含元数据）。
+
+    - `bits=4`：非对称 int4（数据 0.5 B/元素 + 每组 `min`/`step` 各 fp16）；
+    - `bits=8`：非对称 int8（数据 1 B/元素 + 每组元数据），`k_axis` 选 K 的分组方向；
+    - `bits="fp8"`：`float8_e4m3fn`（数据 1 B/元素），`fp8_per="token"` 时每个 `(token,head)` 一个 fp16 scale。
+
+    元数据是记账里最容易漏掉的一块：int4 的 K 每头 4 组 ⇒ **+25%**（实测已由
+    `test_bytes_accounting` 钉住）。
+    """
     n = num_kv_heads * head_dim
 
     def one(dim: int, group: int) -> float:
@@ -115,9 +256,30 @@ def bytes_per_token(
         groups = dim // g
         return dim / 2 + 2 * 2 * groups  # int4 数据 + (min, step) 各 fp16
 
+    kv16 = 2 * head_dim * 2
+    if bits == "fp8":
+        scale_bytes = 2 if fp8_per == "token" else 2 / head_dim  # 每 token 一个 fp16 scale / 每张量一个
+        per = head_dim * 1 + scale_bytes
+        return {
+            "fp16_kv": kv16 * num_slots * num_kv_heads,
+            "int8_kv": 2 * per * num_slots * num_kv_heads,
+            "ratio": kv16 / (2 * per),
+        }
+    if int(bits) == 8:
+        def one8(dim: int, group: int) -> float:
+            g = dim if group in (0, None) else group
+            return dim * 1 + 2 * 2 * (dim // g)  # int8 数据 + (min, step) 各 fp16
+
+        k8 = one8(head_dim, token_group if k_axis == "token" else group_k)
+        v8 = one8(head_dim, group_v)
+        return {
+            "fp16_kv": kv16 * num_slots * num_kv_heads,
+            "int8_kv": (k8 + v8) * num_slots * num_kv_heads,
+            "ratio": kv16 / (k8 + v8),
+        }
+
     k4 = one(head_dim, group_k)
     v4 = one(head_dim, group_v)
-    kv16 = 2 * head_dim * 2
     return {
         "fp16_kv": kv16 * num_slots * num_kv_heads,
         "int4_kv": (k4 + v4) * num_slots * num_kv_heads,
@@ -152,10 +314,16 @@ class QuantRoundTripCache:
         group_k: int = GROUP_K,
         group_v: int = GROUP_V,
         residual: int = 0,
+        kind: str = "int4",
+        base=None,
     ) -> None:
         from .cache import StaticKVCache
 
-        self._base = StaticKVCache(
+        # `base`：**复用**调用方已有的 cache，而不是再分配一份。
+        # 不传的话会新建 —— 而 `dec.cache = QuantRoundTripCache(...)` 这种写法在赋值完成前
+        # 旧 cache 仍然活着，于是两份 cache 同时在显存里（实测 18432 槽位下 2×2.7 GiB + 权重 = 8.3 GiB，
+        # 直接 OOM）。传 `base=dec.cache` 就只占一份。
+        self._base = base if base is not None else StaticKVCache(
             num_slots=num_slots, num_kv_heads=num_kv_heads, head_dim=head_dim,
             max_len=max_len, batch=batch, dtype=dtype, device=device,
         )
@@ -169,6 +337,8 @@ class QuantRoundTripCache:
         self.group_k = group_k
         self.group_v = group_v
         self.residual = int(residual)
+        # `kind` 决定往返用哪套量化（int4 / int8 / int8t / fp8 / fp8t ...），见 `roundtrip`
+        self.kind = kind
         shape = (batch, num_kv_heads, max_len, head_dim)
         # 预分配**共用** scratch，避免每步每层都新分配（否则是 allocator churn，不是真实开销）
         self._k_scratch = torch.zeros(shape, dtype=dtype, device=device)
@@ -206,7 +376,7 @@ class QuantRoundTripCache:
         keep = max(0, used - self.residual)
         scratch[:, :, :used] = x[:, :, :used]
         if keep > 0:
-            scratch[:, :, :keep] = roundtrip_int4(x[:, :, :keep], group, self.dtype)
+            scratch[:, :, :keep] = roundtrip(x[:, :, :keep], self.kind, group, self.dtype)
         return scratch
 
     def update(self, key: torch.Tensor, value: torch.Tensor, layer_idx: int):

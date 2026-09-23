@@ -65,6 +65,27 @@ NEEDLES = [
     ("车后备箱", "26-58-31", 0.88),
 ]
 
+# E5：干扰项数扫描用的地点词表（8 × 8 = 64 种组合，足够铺到 64 条）
+_LOC_A = ["健身房", "办公室", "家里", "车里", "学校", "医院", "酒店", "公司"]
+_LOC_B = ["储物柜", "门禁", "保险箱", "后备箱", "抽屉", "邮箱", "柜子", "工位"]
+
+
+def make_needles(n: int) -> list[tuple[str, str, float]]:
+    """生成 `n` 条**同形**事实（地点 + 号码），深度均匀铺开。
+
+    `n == 4` 时返回原来那 4 条（保持与既有报告可比）；更多条时按词表组合出唯一地点，
+    号码用 `(11+i)-(41+i)-(71+i)` —— 互不为子串，保证"挑错"能被识别出来。
+    """
+    n = int(n)
+    if n == 4:
+        return list(NEEDLES)
+    out = []
+    for i in range(n):
+        suffix = f"{i:02d}" if n > 64 else ""
+        name = _LOC_A[i % 8] + _LOC_B[(i // 8) % 8] + suffix
+        out.append((name, f"{11 + i}-{41 + i}-{71 + i}", (i + 0.5) / n))
+    return out
+
 
 def digits(s: str) -> str:
     return re.sub(r"\D", "", s)
@@ -81,6 +102,8 @@ def make_decoder(nova, kv: str, max_len: int) -> GraphDecoder:
     from nova.kvquant import QuantRoundTripCache
 
     cfg = dec.cfg
+    # 8 位那几档（E3）：kind 直接传给 roundtrip；int4 那几档仍用 quant_k/quant_v 开关
+    kind = kv if kv in ("int8", "int8t", "int8t64", "fp8", "fp8t") else "int4"
     dec.cache = QuantRoundTripCache(
         num_slots=dec.text.num_cache_layers,
         num_kv_heads=cfg.num_key_value_heads,
@@ -89,13 +112,19 @@ def make_decoder(nova, kv: str, max_len: int) -> GraphDecoder:
         quant_k=kv != "int4v",
         quant_v=kv != "int4k",
         residual=128 if kv == "int4res" else 0,
+        kind=kind,
+        base=dec.cache,  # 复用解码器自己那份 cache，否则同时存在两份（18432 槽位下直接 OOM）
     )
     return dec
 
 
-def build(n_rounds: int):
-    """干草堆 + 按深度插入 4 条事实；返回 (msgs, 每条事实在第几轮)。"""
-    spots = {int(round(n_rounds * d)): (name, code) for name, code, d in NEEDLES}
+def build(n_rounds: int, needles=None):
+    """干草堆 + 按深度插入事实；返回 `(msgs, {事实名: 在第几轮})`。
+
+    `needles` 默认用那 4 条；给 `make_needles(16/64)` 就能做 E5 的干扰项扫描。
+    """
+    needles = list(NEEDLES if needles is None else needles)
+    spots = {int(round(n_rounds * d)): (name, code) for name, code, d in needles}
     msgs, at = [], {}
     for i in range(n_rounds):
         if i in spots:
@@ -120,10 +149,13 @@ def main() -> None:
         "--kv",
         nargs="+",
         default=["fp16"],
-        choices=("fp16", "int4", "int4res", "int4k", "int4v"),
+        choices=("fp16", "int4", "int4res", "int4k", "int4v", "int8", "int8t", "int8t64", "fp8", "fp8t"),
         help="K/V 存储精度，**可给多个**（同一轮里轮着跑，跨时间点的速度不可比）："
-             "fp16 基线；int4=K与V都压；int4res=再加最近 128 位置的 fp16 残留窗；int4k/int4v=只压一个",
+             "fp16 基线；int4=K与V都压；int4res=再加最近 128 位置的 fp16 残留窗；int4k/int4v=只压一个；"
+             "int8=按通道分组的 int8；int8t/int8t64=按 token 维分组的 int8（E3）；fp8/fp8t=float8_e4m3fn（per-token / per-tensor）",
     )
+    ap.add_argument("--n-interfere", type=int, nargs="+", default=[4],
+                    help="干扰事实条数（E5 扫描：4 → 16 → 64）；可给多个")
     args = ap.parse_args()
 
     nova, tok = load_bundle(1, "triton")
@@ -131,72 +163,74 @@ def main() -> None:
 
     cfg = nova.model.config
     cost = bytes_per_token(nova.model.num_cache_layers, cfg.num_key_value_heads, cfg.head_dim)
+    cost8 = bytes_per_token(nova.model.num_cache_layers, cfg.num_key_value_heads, cfg.head_dim, bits=8)
+    costf8 = bytes_per_token(nova.model.num_cache_layers, cfg.num_key_value_heads, cfg.head_dim, bits="fp8")
     print(f"模型：Qwen3-VL-4B-Instruct · 单通路 · max_len {args.max_len}")
     print(f"KV 记账：int4 {cost['int4_kv'] / 1024:.0f} KiB/token vs fp16 {cost['fp16_kv'] / 1024:.0f} KiB/token"
-          f" = {cost['ratio']:.2f}x（模拟版不省显存，测的是精度与 dequant 开销）")
-    print(f"干草堆：重复闲聊（每轮带唯一编号）+ 4 条形近事实，埋在不同深度\n")
+          f" = {cost['ratio']:.2f}x；int8 {cost8['int8_kv'] / 1024:.0f} = {cost8['ratio']:.2f}x；"
+          f"fp8 {costf8['int8_kv'] / 1024:.0f} = {costf8['ratio']:.2f}x")
+    print(f"（模拟版不省显存，测的是精度与 dequant 开销）")
+    print(f"干草堆：重复闲聊（每轮带唯一编号）+ 形近事实，埋在不同深度\n")
 
-    scores: dict[tuple[str, int], tuple[int, int, int]] = {}
+    scores: dict[tuple[str, int, int], tuple[int, int, int]] = {}
     for kv in args.kv:
         dec = make_decoder(nova, kv, args.max_len)
-        print(f"\n【{kv}】")
-        print(f"{'长度':>8s} {'实际token':>9s}  追问 4 条：答对 / 挑错 / 没答"
+        print(f"\n【{kv}】 干扰项 {'/'.join(str(n) for n in args.n_interfere)} 条")
+        print(f"{'长度':>8s} {'实际token':>9s}  {'干扰':>4s}  答对 / 挑错 / 没答"
               f"{'':>16s}{'prefill':>9s} {'峰值':>9s} {'clocks.sm':>10s}")
-        for target in args.lens:
-            n_rounds = max(8, int(round(target / 36)))
-            msgs, _at = build(n_rounds)
-            hist_text = render(tok, msgs, add_generation_prompt=False)
-            hist_ids = tok(hist_text, add_special_tokens=False)["input_ids"]
-            if len(hist_ids) + 64 > args.max_len:
-                print(f"{target:>8d}  —— 超过 max_len，跳过（实际 {len(hist_ids)}）")
-                continue
-            hist_t = torch.tensor([hist_ids], device="cuda")
+        for n_int in args.n_interfere:
+            needles = make_needles(n_int)
+            for target in args.lens:
+                n_rounds = max(8, int(round(target / 36)))
+                msgs, _at = build(n_rounds, needles)
+                hist_text = render(tok, msgs, add_generation_prompt=False)
+                hist_ids = tok(hist_text, add_special_tokens=False)["input_ids"]
+                if len(hist_ids) + 64 > args.max_len:
+                    print(f"{target:>8d}  —— 超过 max_len，跳过（实际 {len(hist_ids)}）")
+                    continue
+                hist_t = torch.tensor([hist_ids], device="cuda")
 
-            torch.cuda.reset_peak_memory_stats()
-            t0 = time.perf_counter()
-            dec.prefill(hist_t)
-            torch.cuda.synchronize()
-            prefill_s = time.perf_counter() - t0
-            h = len(hist_ids)
-            clk = clock_sm()
+                torch.cuda.reset_peak_memory_stats()
+                t0 = time.perf_counter()
+                dec.prefill(hist_t)
+                torch.cuda.synchronize()
+                prefill_s = time.perf_counter() - t0
+                h = len(hist_ids)
+                clk = clock_sm()
 
-            right = wrong = none = 0
-            detail = []
-            for name, code, _d in NEEDLES:
-                qtext = f"我的{name}密码是多少？只回答那串号码。"
-                full_text = render(tok, msgs + [{"role": "user", "content": qtext}], add_generation_prompt=True)
-                q_ids = tok(full_text, add_special_tokens=False)["input_ids"][h:]
-                q_t = torch.tensor([q_ids], device="cuda")
-                dec.prefill(q_t, offset=h, reset=False)
-                # ⚠️ 这里**不能**用 capture()+step()：capture 每次都会新建一张 CUDA Graph
-                # 并分配新的内存池，而每个问题的起点位置都不同 -> 每个问题都要重捕一次，
-                # 几次之后显存就爆了（实测跑到第 9 次时 7905/8188 MiB 崩溃）。
-                # 只生成 ~20 个 token，直接 eager 调 `_body()` 就够，还省掉整块图内存。
-                out = []
-                for _ in range(args.max_new):
-                    t = int(dec.input_ids.item())
-                    if t in STOP:
-                        break
-                    out.append(t)
-                    dec._body()
-                text = tok.decode(out, skip_special_tokens=True).strip().replace("\n", " ")
-                got = digits(text)
-                if digits(code) in got:
-                    right += 1
-                    detail.append("O")
-                elif any(digits(c) in got for _n, c, _dd in NEEDLES if c != code):
-                    wrong += 1
-                    detail.append("!")
-                    print(f"        ↳ 挑错！问「{name}」（应 {code}）答的是：{text[:50]}")
-                else:
-                    none += 1
-                    detail.append("X")
-                    print(f"        ↳ {name}（应 {code}）没答出：{text[:50]}")
-                dec.cache.pos.fill_(h)  # 回到干草堆末尾，复用这份 prefill
-            peak = torch.cuda.max_memory_allocated() / 1024 ** 3
-            scores[(kv, target)] = (right, wrong, none)
-            print(f"{target:>8d} {h:>9d}  {right}/4 挑错 {wrong} 没答 {none}   {' '.join(detail):<18s}"
-                  f" [prefill {prefill_s:>6.1f}s · 峰值 {peak:>5.2f} GiB · clocks.sm {clk}]")
+                right = wrong = none = 0
+                detail = []
+                for name, code, _d in needles:
+                    qtext = f"我的{name}密码是多少？只回答那串号码。"
+                    full_text = render(tok, msgs + [{"role": "user", "content": qtext}], add_generation_prompt=True)
+                    q_ids = tok(full_text, add_special_tokens=False)["input_ids"][h:]
+                    q_t = torch.tensor([q_ids], device="cuda")
+                    dec.prefill(q_t, offset=h, reset=False)
+                    out = []
+                    for _ in range(args.max_new):
+                        t = int(dec.input_ids.item())
+                        if t in STOP:
+                            break
+                        out.append(t)
+                        dec._body()
+                    text = tok.decode(out, skip_special_tokens=True).strip().replace("\n", " ")
+                    got = digits(text)
+                    if digits(code) in got:
+                        right += 1
+                        detail.append("O")
+                    elif any(digits(c) in got for _n, c, _dd in needles if c != code):
+                        wrong += 1
+                        detail.append("!")
+                    else:
+                        none += 1
+                        detail.append("X")
+                    dec.cache.pos.fill_(h)
+                peak = torch.cuda.max_memory_allocated() / 1024 ** 3
+                scores[(kv, target, n_int)] = (right, wrong, none)
+                print(f"{target:>8d} {h:>9d}  {n_int:>4d}  {right}/{len(needles)} 挑错 {wrong} 没答 {none}"
+                      f"   [prefill {prefill_s:>6.1f}s · 峰值 {peak:>5.2f} GiB · clocks.sm {clk}]", flush=True)
+            del msgs
+            torch.cuda.empty_cache()
         del dec
         torch.cuda.empty_cache()
 

@@ -15,7 +15,7 @@
 | 代码 | ✅ **S0-S4 全部完成 + 速度路径 ①/② + KV int4 测量 + P0 解码分桶**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码（**分桶：`BUCKETS`/`for_length`/`grow`**）+ 4-bit lm_head + L0 记忆 `memory.py` + KV 量化 `kvquant.py`）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、**`src/s4_memory_demo.py`**、`tests/`（**60 passed**）、`src/bench_nova.py`、`src/bench_graph.py`、`src/bench_memory.py`、`src/diagnostics/`（速度归因 + 记忆诊断 + KV 量化诊断 + **重捕/分桶诊断**） |
 | 环境 | ✅ torch 2.6.0+cu124 + 权重 **8.89 GB 已缓存**（`.hf-cache`）；基线 4-bit 峰值 **2.79 GiB**；**Nova 单通路图解码 14.0 ms/token（71.3 tok/s，3.28 GiB）/ 双通路 22.7 ms/token（44.0 tok/s，4.83 GiB）** |
 | 代码托管 | ✅ **<https://github.com/captain-wangrun-cn/Nova>**（**public**，默认分支 `main`）。提交规范见 [AGENTS.md](AGENTS.md) 第七节 |
-| 下一步 | **第五轮 · 五条证伪实验 + PCIe/主机内存分层**（见第六·补四节）：**E1** ✅ 已结案（不 adopt）→ **E2** ✅ 已结案（不 adopt，见第六·补六）→ **E3** 8 位 KV 对照（**下一步**）→ **E4** 窄化 Triton 证伪（M=1 解包微基准）→ **E5** 干扰项 4/16/64 → **E6** PCIe/主机内存分层；然后 **S5 · 数据与蒸馏**（里程碑 2 起点） |
+| 下一步 | **第五轮**：**E1** ✅ 不 adopt → **E2** ✅ 不 adopt → **E3** ✅ 通过（改选 int8）→ **E5** ✅ 结案（尺子升级到 ≥16 条）→ **E4** 窄化 Triton 证伪（**靶子改成 int8**）→ **E6** PCIe/主机内存分层；然后 **S5 · 数据与蒸馏**（里程碑 2 起点） |
 
 **一句话：设计做完了，现在要开始证明"双通路 + 内部记忆"在 8GB 显存上真的能跑。**
 
@@ -27,7 +27,7 @@
 > 2. **缓存不再放 `H:\hf-cache`。** 本次按用户指示"直接在 nova 文件夹下"，改为项目内 `.hf-cache/` / `.pip-cache/` / `.tmp/`（已进 `.gitignore`）。因为项目实体就在 H 盘，这些目录同样**不在 C 盘**。⚠️ **若照抄 `AGENTS.md` 的 `HF_HOME='H:\hf-cache'`，会另建一份重复的 9GB 缓存**——本次不要照抄。
 > 3. **C 盘余量是 6.48GB**，不是文档写的 0.4GB。仍然不写入 C 盘。
 > 4. **本机机器级环境变量 `HF_ENDPOINT=hf-mirror.com` 缺少协议头**，会让所有 HF 请求直接报 `UnsupportedProtocol`。**必须显式覆盖为带协议的形式：** `$env:HF_ENDPOINT='https://hf-mirror.com'`。
-> 5. **`AGENTS.md` 第五节的 `codex.exe` 硬编码路径已过期**（哈希目录从 `eab8377aebac6c07` 变成 `247581e40ee272fb`）。写文件时用 `$exe = (Get-Command codex).Source` 动态取，**不要照抄硬编码路径**。
+> 5. ~~`AGENTS.md` 第五节的 `codex.exe` 硬编码路径已过期~~ —— **2026-09-23 起不再需要**：`apply_patch` 工具已可直接改文件（含中文），AGENTS.md 第五节已改成"直接用 `apply_patch`"，绕行脚本与硬编码路径都已删除。
 > 6. **`triton-windows 3.2.0.post21` 已装入 `.venv`**（与 torch 2.6.0 兼容；`3.8.0` 不兼容）。Triton / Inductor 缓存目录必须显式指向 H 盘（`TRITON_CACHE_DIR` / `TORCHINDUCTOR_CACHE_DIR`），否则报 `WinError 5`。**但 `torch.compile` 目前对本模型不可用**，见 **D27**。
 > 7. **命名澄清（易误判）：`reports/speed-path1-nf4-gemv.md` 与 `tests/test_nf4_linear.py` 属于「速度路径 ①」，不是路线图的 S4。** 路线图的 **S4 = 记忆最小实现**，已在 **2026-09-22 完成**（见第七节）。这两处此前误标了 "S4"，已改名/改标题。
 
@@ -326,6 +326,36 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 ---
 
 ## 七、S4 · 记忆最小实现（✅ 已完成 2026-09-22 —— **8/8 取回，跨进程可复现**）
+## 六·补七 · E3 8 位 KV（✅ 2026-09-23 —— **通过，改选 int8**）
+
+**报告：[reports/kv-quant-8bit.md](reports/kv-quant-8bit.md) · 决策 D38 · 探针 `src/diagnostics/probe_kvquant_bits.py` · 测试 `tests/test_kvquant.py`（19 条）**
+
+**已核查（真实 K/V 3665 token + needle 8K 档，同轮）：**
+
+1. **`int8`（K 按 token 维分组，`int8t64`）与 fp16 逐题一致**：4 干扰 4/4、16 干扰 13/16、64 干扰 54/64，含挑错的那几条都相同。
+2. **误差只有 int4 的 1/50**：K relL2 0.0018（int4 0.0910）；**通道最坏 0.0037**（int4 0.7705）。
+3. **记账 1.86–1.91x**（int4 3.46x）；prefill 与 fp16 基本同速，**远好于"int4 先反量化再喂 SDPA"**。
+4. **D34 第 3 条被验证**：K 改按 token 维分组后通道最坏误差 **18x** 变好。
+5. `fp8` 不进默认路径（精度不占优、记账更差、per-tensor 更糟）；要写融合核就写 **int8** 的。
+6. 顺手修一个真 OOM：`QuantRoundTripCache` 必须用 `base=dec.cache` 复用已有 cache（否则两份 cache 同时在显存里，18432 槽位下 8.3 GiB 直接爆）。
+
+---
+
+## 六·补八 · E5 干扰项扫描（✅ 2026-09-23 —— **尺子本身就是结论**）
+
+**报告：[reports/interference-scan.md](reports/interference-scan.md) · 决策 D39 · 尺子 `exp_needle.make_needles(n)`**
+
+| 干扰项 | fp16 | `int8` | `int8t64` | `fp8` |
+|---:|---|---|---|---|
+| 4 | 4/4 | 4/4 | 4/4 | 4/4 |
+| 16 | **13/16** | 13/16 | 13/16 | 12/16 |
+| 64 | **54/64** | — | 54/64 | — |
+
+- **4 条干扰测不出任何东西**（当年 int4 的"零退化"就是这个原因）；16 条时**基线自己就掉 3 题**。
+- **失败形态全是"挑错"**（答成另一条同形事实），"没答出"为 0 ⇒ 要防的是**混淆**，不是遗忘（与 D32 一致）。
+- 判据升级：**以后"是否损伤检索"一律在 ≥16 条干扰下判**。
+
+---
 
 **报告：[reports/s4-memory-min.md](reports/s4-memory-min.md) · 决策 D31 · 演示 `src/s4_memory_demo.py` · 基准 `src/bench_memory.py`**
 
@@ -399,7 +429,7 @@ $env:HF_HUB_OFFLINE='1'; $env:TRITON_CACHE_DIR=$env:TMP+'\triton-cache'; $env:TO
 | `docs/01` ~ `docs/16` | 设计文档（15 愿景 / 02 架构 / 03 记忆 / 11 路线图 / 13 决策 / 15 语言 / 16 模型解剖） |
 | `src/` | 代码（S0-S4 全部完成；`nova/` 是双通路骨架 + 图解码（**分桶**）+ **滑动窗口 `WindowedKVCache`** + L0 记忆 + KV 量化 `kvquant.py`，`chat.py` 交互 CLI，`diagnostics/` 是速度归因 + 记忆诊断 + KV 量化诊断 + 分桶/重捕诊断 + **路由/滑窗实验（`probe_memory_routing.py` / `exp_swa.py` / `probe_swa_memory.py`）**） |
 | `tests/` | 单元测试（**66 passed**：`test_nova_skeleton.py` 9 条 + `test_graph_decode.py` 4 条 + `test_nf4_linear.py` 11 条 + `test_lm_head4.py` 5 条 + `test_memory.py` 12 条 + `test_kvquant.py` 13 条 + `test_decode_mask_bucket.py` 6 条 + **`test_swa.py` 6 条**） |
-| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / `speed-path1-nf4-gemv` / `s4-memory-min` / `long-context-attention` / `kv-int4` / `decode-mask-bucket` / `memory-routing` / **`swa-window`**） |
+| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / `speed-path1-nf4-gemv` / `s4-memory-min` / `long-context-attention` / `kv-int4` / `decode-mask-bucket` / `memory-routing` / `swa-window` / **`kv-quant-8bit`** / **`interference-scan`**） |
 | `data/` | 评测集、训练数据（待建，**放 H 盘更大的话用软链接**） |
 | `models/` | 本地权重（建议只放软链接，实体在 `H:\hf-cache`） |
 

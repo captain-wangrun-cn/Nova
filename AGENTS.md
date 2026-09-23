@@ -53,24 +53,13 @@ $env:TMP           = 'H:\tmp'
 
 > 不设 HF_HOME，模型会下到 `C:\Users\18889\.cache\huggingface`（约 9GB），**直接把 C 盘塞爆**。
 
-## 五、写文件的方法（重要）
+## 五、写文件的方法
 
-本目录文件用 `apply_patch` 修改。但**直接调用 `apply_patch.bat` 会因 UTF-8 中文内容报错**，必须走 exe。可用模板（`（文件内容）` 换成正文）：
+**直接用 `apply_patch` 工具**（`*** Add File:` / `*** Update File:` / `*** Delete File:`）。
+中文内容没有问题，不需要任何绕行脚本。
 
-```powershell
-$exe="C:\Users\18889\AppData\Local\OpenAI\Codex\bin\eab8377aebac6c07\codex.exe"
-$body = @'
-（文件内容）
-'@
-$l = (($body.TrimEnd("`r","`n") -split "`r?`n") | ForEach-Object {"+"+$_}) -join "`n"
-& $exe --codex-run-as-apply-patch ("*** Begin Patch`n*** Add File: 路径`n" + $l + "`n*** End Patch")
-```
-
-**两个必须注意的坑：**
-1. 上面 `'@` 的位置，真实使用时是一个**独占一行的单引号加 @ 符号**（本文档里用占位符，因为直接写会提前结束字符串）。
-2. here-string 的收尾符**必须独占一行**；漏掉它会得到"exit code 1 且无任何输出"的空错误，很难查。
-
-- **修改已有文件**：把 `*** Add File: 路径` 换成 `*** Update File: 路径`，正文里用上下文行 + `-`/`+` 标注增删。
+- 新增文件用 `*** Add File: 路径`，正文每行以 `+` 开头。
+- 改已有文件用 `*** Update File: 路径`，`@@` 上下文 + `-`/`+` 标注增删；改完**不要**再读一遍文件确认（失败会报错）。
 - 联网受限：访问 Hugging Face / PyPI 若失败，请用 `require_escalated` 重新发起。
 - 中国大陆网络可试镜像：`$env:HF_ENDPOINT = 'https://hf-mirror.com'`。
 
