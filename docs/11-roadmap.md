@@ -21,7 +21,7 @@
 **交付物：** 本套设计文档
 
 > **具体执行步骤、命令与验收标准见 [HANDOFF.md](../HANDOFF.md) 第二节至第四节（S0 / S1）。**
-> 关键环境事实：C 盘仅剩 0.4GB，HF_HOME 等缓存目录必须指向 H 盘（详见 [AGENTS.md](../AGENTS.md) 第四节）。
+> 关键环境事实：C 盘仅剩 6.48GB，缓存一律放项目内 `.hf-cache/` / `.pip-cache/` / `.tmp/`（详见 [AGENTS.md](../AGENTS.md) 第四节）。
 
 ---
 
@@ -43,7 +43,7 @@
    - safetensors 读写
    - 加载 / 保存 / 校验
    - 另加：`schema_digest` + `model_fingerprint` 不匹配**拒绝加载**（D09）
-4. ✅ **单元测试**（`pytest tests -q` → **40 passed**）
+4. ✅ **单元测试**（`pytest tests -q` → **66 passed**）
    - ✅ 前向传播正确性
    - ✅ 显存占用达标（< 7GB）—— 双通路 + 记忆 + 1024 槽位 cache 峰值 **5.17 GiB**
    - ✅ 交叉注意力隔离性
@@ -163,9 +163,10 @@
 
 ---
 
-## 下一步行动（立即可做）
+## 下一步行动（2026-09-23）
 
-1. **搭建环境**：确认 PyTorch 可用（本机 python 不在 PATH，用 `C:\Users\18889\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe`）
-2. **下载 Qwen3-VL-4B-Instruct**：确认权重可获取
-3. **写第一个单元测试**：加载模型 + 前向传播
-4. **实测中英 token 效率**：用 Qwen3-VL 的 tokenizer 对比同义中英文本的 token 数（修正 D02 的论据）
+> 原「立即可做」四条（搭环境 / 下权重 / 第一个单测 / 中英 token 效率）**均已 ✅ 完成**。当前队列：
+
+1. **写 int8 融合注意力核** —— 靶子已定死（**D38** 的 `int8` + K 按 token 维分组）；可行性见 **D40**：int8 达 **86% 带宽**，int4 结案
+2. **记忆段接 `SegmentPrefetcher`** —— 预取写法已落地 **2.55x**（**D41**）；端到端延迟**待实测**
+3. **S5 · 数据与蒸馏** —— 里程碑 2 起点；教师池已冻结（**D24**，v4 七层）

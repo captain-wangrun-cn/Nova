@@ -1,5 +1,7 @@
 # AGENTS.md · Nova 项目工作守则
 
+> 更新：2026-09-23（第四节环境事实已同步）。
+
 > 任何新会话（新 agent）进入本目录，**先读 [HANDOFF.md](HANDOFF.md)**，再读 [docs/13-decisions.md](docs/13-decisions.md) 与 [docs/11-roadmap.md](docs/11-roadmap.md)。
 > 本文件是规则层，HANDOFF.md 是"现在做什么"。
 
@@ -30,33 +32,36 @@ Nova 是一个 **单用户、单人格、有持续记忆** 的脑启发式个人
 - **产物落盘：** 每完成一步，把结果与验收证据写进 `reports/`，并回写到对应 docs 章节。
 - **风格：** 紧凑、直接、可执行。给出排序过的短方案，而不是长篇分析。
 
-## 四、环境事实（已核查 · 2026-09-21）
+## 四、环境事实（已核查 · 2026-09-23）
 
 | 项 | 值 |
 |------|------|
+| 项目路径 | `D:\360MoveData\Users\18889\Documents\Nova` 是**符号链接**，实体在 **`H:\Nova`** —— 项目内的缓存 / venv 实际都落在 H 盘 |
 | Python（唯一可用） | `C:\Users\18889\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe`（3.12.14）；本机 `python` / `py` **不在 PATH** |
-| pip | 26.2.1（随上述运行时） |
-| git | 2.49.0.windows.1 |
-| torch | 未安装（需装进项目 venv） |
+| 项目 venv | `.venv\Scripts\python.exe` —— torch 2.6.0+cu124、transformers、triton-windows 3.2.0.post21 |
+| pip / git | 26.2.1 / 2.49.0.windows.1 |
 | GPU | NVIDIA GeForce RTX 4060 Laptop GPU，**8188 MiB**，驱动 610.88 |
-| 磁盘 C: | Fixed，**仅剩 0.4 GB** —— **绝对不要把任何下载 / 缓存 / venv 写到 C 盘** |
-| 磁盘 D: | Fixed，剩 32 GB —— 放**代码与 venv** |
-| 磁盘 H: | Fixed，剩 131.9 GB —— 放**模型权重、数据集、HF 缓存、pip 缓存** |
+| 磁盘 C: | **剩 6.48 GB** —— **绝对不要把任何下载 / 缓存 / venv 写到 C 盘** |
+| 磁盘 H: | Fixed，剩 131.9 GB —— 项目实体、权重、缓存都在这里 |
+| 权重 | Qwen3-VL-4B-Instruct，**8.89 GB 已缓存**在项目内 `.hf-cache/` |
 
-**每次会话开始必须设置的环境变量：**
+**每次会话开始必须设置的环境变量**（缓存一律放**项目内**；不要再指到 `H:\hf-cache`，那会另建一份 9GB 重复缓存）：
 
 ```powershell
-$env:HF_HOME       = 'H:\hf-cache'
-$env:PIP_CACHE_DIR = 'H:\pip-cache'
-$env:TMP           = 'H:\tmp'
+$env:HF_HOME        = (Resolve-Path .).Path + '\.hf-cache'
+$env:PIP_CACHE_DIR  = (Resolve-Path .).Path + '\.pip-cache'
+$env:TMP            = (Resolve-Path .).Path + '\.tmp'
+$env:TEMP           = $env:TMP
+$env:TRITON_CACHE_DIR        = $env:TMP + '\triton-cache'
+$env:TORCHINDUCTOR_CACHE_DIR = $env:TMP + '\inductor-cache'
 ```
 
 > 不设 HF_HOME，模型会下到 `C:\Users\18889\.cache\huggingface`（约 9GB），**直接把 C 盘塞爆**。
 
 - 联网受限：访问 Hugging Face / PyPI 若失败，请用 `require_escalated` 重新发起。
-- 中国大陆网络可试镜像：`$env:HF_ENDPOINT = 'https://hf-mirror.com'`。
+- 中国大陆网络可试镜像，**必须带协议头**（机器级 `HF_ENDPOINT` 缺协议头会让所有 HF 请求报 `UnsupportedProtocol`）：`$env:HF_ENDPOINT = 'https://hf-mirror.com'`。
 
-## 六、禁区（现阶段）
+## 五、禁区（现阶段）
 
 1. 不要先训练（双通路骨架未验证，数据与算力都是浪费）
 2. 不要先做量化 / 部署格式 / GGUF 转换
@@ -66,12 +71,9 @@ $env:TMP           = 'H:\tmp'
 
 ---
 
-## 七、Git 提交规范
+## 六、Git 提交规范
 
 **仓库：** <https://github.com/captain-wangrun-cn/Nova>（**public**，默认分支 `main`，远端名 `origin`）。
-
-> 沙箱环境下 `git` 可能报 `dubious ownership`；用 `git -c safe.directory=H:/Nova ...`。
-> 写 `.git` 需要提权（沙箱里 `.git` 只给读权限）。
 
 **格式：**
 

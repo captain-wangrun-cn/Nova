@@ -1,7 +1,7 @@
 # HANDOFF.md · 交接与执行顺序
 
 > 面向**新会话的 agent**。先读 [AGENTS.md](AGENTS.md)（规则 + 环境事实），再看本文件（做什么、按什么顺序）。
-> 更新于 **2026-09-22**。
+> 更新于 **2026-09-23**。
 
 ---
 
@@ -10,26 +10,25 @@
 | 项 | 状态 |
 |------|------|
 | 设计文档 | ✅ **16 份，3359 行**（`docs/01` ~ `docs/16`） |
-| 决策 | ✅ **35 条**（`docs/13-decisions.md`）；D19 待定，D21/D22 已被 D23/D24 取代，**D26 技术归因已被 D27 更正**，**D30 取代 D29 第 2 条的路径排序**，**D32 更正 D31 的解读**，**D33 补充 D28 的成立条件**；新增 D31（S4 记忆最小实现）、D32（S4 对照实验）、D33（长上下文注意力）、D34（KV int4 量化：精度无退化，但 3.46x 收益未到手）、**D35（拆 O(n²) 掩码表 + 容量分桶：decode 少搬 48–60%，并推翻"重捕爆显存"）** |
+| 决策 | ✅ **41 条（D01–D41）**（`docs/13-decisions.md`）；D19 待定，D21/D22 已被 D23/D24 取代，**D26 技术归因已被 D27 更正**，**D30 取代 D29 第 2 条的路径排序**，**D32 更正 D31 的解读**，**D33 补充 D28 的成立条件**；第五轮新增 **D36（E1 路由不 adopt）/ D37（E2 滑窗不 adopt）/ D38（E3 改选 int8）/ D39（E5 判据升到 ≥16 条干扰）/ D40（E4 融合核：int8 可写、int4 结案）/ D41（E6 预取 2.55x）** |
 | 教师选型 | ✅ **已冻结（v4 七层，D24）**，S5 直接执行，不要重新调研 |
-| 代码 | ✅ **S0-S4 全部完成 + 速度路径 ①/② + KV int4 测量 + P0 解码分桶**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码（**分桶：`BUCKETS`/`for_length`/`grow`**）+ 4-bit lm_head + L0 记忆 `memory.py` + KV 量化 `kvquant.py`）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、**`src/s4_memory_demo.py`**、`tests/`（**60 passed**）、`src/bench_nova.py`、`src/bench_graph.py`、`src/bench_memory.py`、`src/diagnostics/`（速度归因 + 记忆诊断 + KV 量化诊断 + **重捕/分桶诊断**） |
+| 代码 | ✅ **S0-S4 全部完成 + 速度路径 ①/② + 第五轮 E1–E6 + P0 解码分桶**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码（**分桶：`BUCKETS`/`for_length`/`grow`**）+ 4-bit lm_head + L0 记忆 `memory.py` + KV 量化 `kvquant.py`（int4 / int8 / fp8）+ 主机内存预取 `prefetch.py`）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、**`src/s4_memory_demo.py`**、`tests/`（**66 passed**）、`src/bench_nova.py`、`src/bench_graph.py`、`src/bench_memory.py`、`src/diagnostics/`（速度归因 + 记忆诊断 + KV 量化诊断 + 重捕/分桶诊断 + 路由 / 滑窗 / 分层探针） |
 | 环境 | ✅ torch 2.6.0+cu124 + 权重 **8.89 GB 已缓存**（`.hf-cache`）；基线 4-bit 峰值 **2.79 GiB**；**Nova 单通路图解码 14.0 ms/token（71.3 tok/s，3.28 GiB）/ 双通路 22.7 ms/token（44.0 tok/s，4.83 GiB）** |
-| 代码托管 | ✅ **<https://github.com/captain-wangrun-cn/Nova>**（**public**，默认分支 `main`）。提交规范见 [AGENTS.md](AGENTS.md) 第七节 |
+| 代码托管 | ✅ **<https://github.com/captain-wangrun-cn/Nova>**（**public**，默认分支 `main`）。提交规范见 [AGENTS.md](AGENTS.md) 第六节 |
 | 下一步 | **第五轮已全部结案**：E1 ❌不 adopt · E2 ❌不 adopt · E3 ✅改选 int8 · E4 ✅int8 可写核/int4 结案 · E5 ✅尺子升级 · E6 ✅预取落地 · P0 ✅解码分桶。**接下来**：①写 int8 融合注意力核（D38+D40 已把靶子定死）②记忆段接 SegmentPrefetcher ③**S5 · 数据与蒸馏**（里程碑 2 起点） |
 
 **一句话：设计做完了，现在要开始证明"双通路 + 内部记忆"在 8GB 显存上真的能跑。**
 
 ---
 
-> ## ⚠️ 2026-09-21 环境事实更正（新会话必读；`AGENTS.md` 第四节尚未同步）
+> ## ⚠️ 2026-09-21 环境事实更正（原始记录；内容已并入 `AGENTS.md` 第四节）
 >
 > 1. **`D:\360MoveData\Users\18889\Documents\Nova` 是一个符号链接 → `H:\Nova`。** 项目实体在 **H 盘**上，不是 D 盘。写"D 盘"实际消耗的是 H 盘空间。因此第三节"**D 盘低于 10GB 时把 `.venv` 挪到 H 盘**"的预案**不适用**（它已经在 H 盘上了）。
-> 2. **缓存不再放 `H:\hf-cache`。** 本次按用户指示"直接在 nova 文件夹下"，改为项目内 `.hf-cache/` / `.pip-cache/` / `.tmp/`（已进 `.gitignore`）。因为项目实体就在 H 盘，这些目录同样**不在 C 盘**。⚠️ **若照抄 `AGENTS.md` 的 `HF_HOME='H:\hf-cache'`，会另建一份重复的 9GB 缓存**——本次不要照抄。
+> 2. **缓存不再放 `H:\hf-cache`。** 本次按用户指示"直接在 nova 文件夹下"，改为项目内 `.hf-cache/` / `.pip-cache/` / `.tmp/`（已进 `.gitignore`）。因为项目实体就在 H 盘，这些目录同样**不在 C 盘**。⚠️ **别把缓存指回 `H:\hf-cache`，那会另建一份重复的 9GB 缓存。**
 > 3. **C 盘余量是 6.48GB**，不是文档写的 0.4GB。仍然不写入 C 盘。
 > 4. **本机机器级环境变量 `HF_ENDPOINT=hf-mirror.com` 缺少协议头**，会让所有 HF 请求直接报 `UnsupportedProtocol`。**必须显式覆盖为带协议的形式：** `$env:HF_ENDPOINT='https://hf-mirror.com'`。
-> 5. ~~`AGENTS.md` 第五节的 `codex.exe` 硬编码路径已过期~~ —— **2026-09-23 起不再需要**：`apply_patch` 工具已可直接改文件（含中文），AGENTS.md 第五节已改成"直接用 `apply_patch`"，绕行脚本与硬编码路径都已删除。
-> 6. **`triton-windows 3.2.0.post21` 已装入 `.venv`**（与 torch 2.6.0 兼容；`3.8.0` 不兼容）。Triton / Inductor 缓存目录必须显式指向 H 盘（`TRITON_CACHE_DIR` / `TORCHINDUCTOR_CACHE_DIR`），否则报 `WinError 5`。**但 `torch.compile` 目前对本模型不可用**，见 **D27**。
-> 7. **命名澄清（易误判）：`reports/speed-path1-nf4-gemv.md` 与 `tests/test_nf4_linear.py` 属于「速度路径 ①」，不是路线图的 S4。** 路线图的 **S4 = 记忆最小实现**，已在 **2026-09-22 完成**（见第七节）。这两处此前误标了 "S4"，已改名/改标题。
+> 5. **`triton-windows 3.2.0.post21` 已装入 `.venv`**（与 torch 2.6.0 兼容；`3.8.0` 不兼容）。Triton / Inductor 缓存目录必须显式指向 H 盘（`TRITON_CACHE_DIR` / `TORCHINDUCTOR_CACHE_DIR`），否则报 `WinError 5`。**但 `torch.compile` 目前对本模型不可用**，见 **D27**。
+> 6. **命名澄清（易误判）：`reports/speed-path1-nf4-gemv.md` 与 `tests/test_nf4_linear.py` 属于「速度路径 ①」，不是路线图的 S4。** 路线图的 **S4 = 记忆最小实现**，已在 **2026-09-22 完成**（见第七节）。这两处此前误标了 "S4"，已改名/改标题。
 
 ---
 
@@ -184,7 +183,7 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 
 ---
 
-## 六·补 · 速度路径 ①：Triton NF4 GEMV（✅ 2026-09-22 结案 —— **方向证伪**）
+## 六·补一 · 速度路径 ①：Triton NF4 GEMV（✅ 2026-09-22 结案 —— **方向证伪**）
 
 > 完整报告：[reports/speed-path1-nf4-gemv.md](reports/speed-path1-nf4-gemv.md) · 决策 **D30**（取代 D29 第 2 条的路径排序）
 
@@ -356,7 +355,22 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 
 ---
 
-## 七、S4 · 记忆最小实现（✅ 已完成 2026-09-22 —— **8/8 取回，跨进程可复现**）
+## 六·补九 · E4 解包微基准（✅ 2026-09-23 —— **int8 可写核，int4 结案**）
+
+**报告：[reports/kv-unpack-bench.md](reports/kv-unpack-bench.md) · 决策 D40 · 脚本 `src/diagnostics/bench_int8_unpack.py`（不加载模型，随时可重跑）**
+
+| 模式 | 每次读 | 有效带宽 | 相对 232.5 GiB/s 上限 | 同一份 KV 的耗时 vs fp16 |
+|---|---:|---:|---:|---:|
+| `fp16`（基线） | 0.125 GiB | 230.9 GiB/s | 99.3% | 1.00x |
+| **`int8`** | 0.070 GiB | **200.5 GiB/s** | **86.3%** | **0.65x（快 1.54x）** |
+| `int4`（打包） | 0.039 GiB | 53.4 GiB/s | 23.0% | **1.35x（更慢）** |
+
+- 判据"≥50% 带宽 ⇒ 有戏"：**int8 86.3% 通过**（5 组 block/warps 配置 85.5–86.3%，稳定）。
+- 判据"<25% ⇒ 结案"：**int4 23.0% 触发**，且**比 fp16 还慢** —— 省下的带宽被 nibble 解包算术吃光（**D30 的教训重演**）。
+- ⇒ **要写融合核就写 int8 的**（靶子 = D38 的 `int8` + K 按 token 维分组）；int4 只作为**存储格式**保留。D34 的"先别写融合核"由此推进为"可以写了，靶子是 int8"。
+
+---
+
 ## 六·补十 · E6 主机内存分层（✅ 2026-09-23 —— **预取写法落地 2.55x；并行上限 5.3%**）
 
 **报告：[reports/kv-tiering.md](reports/kv-tiering.md) · 决策 D41 · 代码 `src/nova/prefetch.py` · 探针 `src/diagnostics/probe_kv_tiering.py`**
@@ -373,6 +387,8 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 - 待实测：接进 `memory.py` 检索路径的端到端延迟。
 
 ---
+
+## 七、S4 · 记忆最小实现（✅ 已完成 2026-09-22 —— **8/8 取回，跨进程可复现**）
 
 **报告：[reports/s4-memory-min.md](reports/s4-memory-min.md) · 决策 D31 · 演示 `src/s4_memory_demo.py` · 基准 `src/bench_memory.py`**
 
@@ -415,7 +431,7 @@ $env:HF_HUB_OFFLINE='1'; $env:TRITON_CACHE_DIR=$env:TMP+'\triton-cache'; $env:TO
 
 | 事项 | 何时决定 | 说明 |
 |------|:---:|------|
-| ~~**速度路径 ①/②**~~ | ✅ **已定（D30）** | ①=自写 NF4 GEMV **已证伪并结案**（比 bnb 慢 1.31~2.75x）；②=量化 lm_head **已落地**（−2.0 ms/token，见第六·补节）。**余下：③ 融合 RoPE / 去冗余拷贝 → ④ 融合注意力** |
+| ~~**速度路径 ①/②**~~ | ✅ **已定（D30）** | ①=自写 NF4 GEMV **已证伪并结案**（比 bnb 慢 1.31~2.75x）；②=量化 lm_head **已落地**（−2.0 ms/token，见第六·补一节）。**余下：③ 融合 RoPE / 去冗余拷贝 → ④ 融合注意力**（靶子见 D38 + D40：写 **int8** 的核） |
 | D19 是否换基座 | **S2 基线出来之后** | 只有实测显示英文 RP 明显弱，才值得付出"中文保底"的代价 |
 | 双通路代码怎么起步：改 transformers 的 `modeling_qwen3_vl.py`，还是自己写一份 `nn.Module` | **S3 开始前** | 改动量大、要跟上游版本，但省掉权重映射；自写更干净但要自己写映射（见 [docs/16-model-anatomy.md](docs/16-model-anatomy.md) 第二节） |
 | 部署格式（PyTorch / 自定义引擎 / GGUF） | 里程碑 2 之后 | 自定义架构大概率不能用 GGUF |
@@ -423,16 +439,16 @@ $env:HF_HUB_OFFLINE='1'; $env:TRITON_CACHE_DIR=$env:TMP+'\triton-cache'; $env:TO
 
 ---
 
-## 九、未验证事实清单（写代码前先确认）
+## 九、未验证事实清单（写代码前先确认；2026-09-23 更新状态）
 
 1. ✅ ~~`transformers` 是否已支持 `qwen3_vl` 架构~~ —— **已核查：支持**（transformers 5.17.0，`qwen3_vl` 在 `CONFIG_MAPPING` 与 `MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES` 中，无需 `trust_remote_code`）。见 [reports/s0-environment.md](reports/s0-environment.md) 第三节
-2. `bitsandbytes` 在 Windows + py3.12 是否可用
-3. Qwen3-VL-4B 在 4060 上的真实速度（S2 才知道）
-4. Hugging Face 是否可直连（不通走镜像）
+2. ✅ ~~`bitsandbytes` 在 Windows + py3.12 是否可用~~ —— **已核查：可用**（S2 的 4-bit 基线就是它；实测确实在跑 CUDA，见 **D27**）
+3. ✅ ~~Qwen3-VL-4B 在 4060 上的真实速度~~ —— **已实测**：4-bit **10.64 tok/s**（[reports/baseline-qwen3vl4b.md](reports/baseline-qwen3vl4b.md)）
+4. ✅ ~~Hugging Face 是否可直连~~ —— **已核查：需镜像**（`$env:HF_ENDPOINT='https://hf-mirror.com'`）
 5. ✅ ~~中英 token 效率比值（S1）~~ —— **已实测 1.02x**（[reports/tokenizer-report.md](reports/tokenizer-report.md)）
-6. D 盘 32GB 是否够用（不够则 venv 也挪到 H）
-7. Qwen3-VL-4B 的视觉塔参数量与显存占用（影响双通路预算）
-8. transformers 里 `qwen3_vl` 的实现是否适合直接改造成双通路（决定 S3 的起步方式）
+6. ✅ ~~D 盘 32GB 是否够用~~ —— **作废**：`D:` 是符号链接，项目实体在 H 盘（见第一节）
+7. Qwen3-VL-4B 的视觉塔参数量与显存占用（影响双通路预算）—— **待实测**（S3 / S4 都只跑文本通路）
+8. ✅ ~~transformers 里 `qwen3_vl` 的实现是否适合直接改造成双通路~~ —— **已核查：走自写精简前向**（S3 已完成，[reports/s3-dual-path-skeleton.md](reports/s3-dual-path-skeleton.md)）
 
 ---
 
@@ -440,13 +456,13 @@ $env:HF_HUB_OFFLINE='1'; $env:TRITON_CACHE_DIR=$env:TMP+'\triton-cache'; $env:TO
 
 | 路径 | 内容 |
 |------|------|
-| `AGENTS.md` | 规则、硬约束、环境事实、写文件方法 |
+| `AGENTS.md` | 规则、硬约束、环境事实、禁区、提交规范 |
 | `HANDOFF.md` | 本文件：执行顺序与交接 |
 | `README.md` | 项目总览与文档索引 |
 | `docs/01` ~ `docs/16` | 设计文档（15 愿景 / 02 架构 / 03 记忆 / 11 路线图 / 13 决策 / 15 语言 / 16 模型解剖） |
 | `src/` | 代码（S0-S4 全部完成；`nova/` 是双通路骨架 + 图解码（**分桶**）+ **滑动窗口 `WindowedKVCache`** + L0 记忆 + KV 量化 `kvquant.py`，`chat.py` 交互 CLI，`diagnostics/` 是速度归因 + 记忆诊断 + KV 量化诊断 + 分桶/重捕诊断 + **路由/滑窗实验（`probe_memory_routing.py` / `exp_swa.py` / `probe_swa_memory.py`）**） |
 | `tests/` | 单元测试（**66 passed**：`test_nova_skeleton.py` 9 条 + `test_graph_decode.py` 4 条 + `test_nf4_linear.py` 11 条 + `test_lm_head4.py` 5 条 + `test_memory.py` 12 条 + `test_kvquant.py` 13 条 + `test_decode_mask_bucket.py` 6 条 + **`test_swa.py` 6 条**） |
-| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / `speed-path1-nf4-gemv` / `s4-memory-min` / `long-context-attention` / `kv-int4` / `decode-mask-bucket` / `memory-routing` / `swa-window` / `kv-quant-8bit` / `interference-scan` / **`kv-unpack-bench`**） |
+| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / `speed-path1-nf4-gemv` / `s4-memory-min` / `long-context-attention` / `kv-int4` / `decode-mask-bucket` / `memory-routing` / `swa-window` / `kv-quant-8bit` / `interference-scan` / `kv-unpack-bench` / **`kv-tiering`**） |
 | `data/` | 评测集、训练数据（待建，**放 H 盘更大的话用软链接**） |
 | `models/` | 本地权重（建议只放软链接，实体在 `H:\hf-cache`） |
 
@@ -544,7 +560,7 @@ $env:HF_HUB_OFFLINE='1'; $env:TRITON_CACHE_DIR=$env:TMP+'\triton-cache'; $env:TO
 
 ---
 
-## 十一、第一天的完成标准
+## 十一、第一天的完成标准（历史记录 · 2026-09-21）
 
 1. ✅ S0 跑通：`torch.cuda.is_available()` 为 True
 2. ✅ S1 报告落盘，并把 [docs/15-language-plan.md](docs/15-language-plan.md) 第 2.5 节的"待实测"替换为实测数字

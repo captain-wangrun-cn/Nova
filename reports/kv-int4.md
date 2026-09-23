@@ -174,7 +174,7 @@ used = start + n                            # ✅ decode 与 prefill 都对
 
 ## 五、开销：「先还原再算」到底多贵
 
-`probe_kvquant_real.py [C]` —— **同一轮内交替两遍取小值**（AGENTS.md 第七节第 4 条：跨时间点的数字不能比）：
+`probe_kvquant_real.py [C]` —— **同一轮内交替两遍取小值**（AGENTS.md 第六节第 4 条：跨时间点的数字不能比）：
 
 | 条件 | prefill fp16 → int4 | decode fp16 → int4 |
 |---|:---:|:---:|

@@ -90,7 +90,7 @@ $env:TORCHINDUCTOR_CACHE_DIR='H:\Nova\.tmp\inductor-cache'
 | `probe_kernel_mapping.py` | **数值正确性（改注意力路径必过）**：两边钉 math 时逐位一致（0.000e+00）→ `repeat_kv` 的 GQA 映射正确；与手写 fp32 参考误差相同（4.07e-04） | 同上 |
 | `probe_attention_tradeoff.py` | 后端可用性（MATH 6.76 GiB / 5293 ms vs EFFICIENT **3.26 GiB / 1299 ms**）+ **贪心 32/32 token 一致** | 同上 |
 | `probe_kernel_equivalence.py` | 展平后的**长度天花板**：7146 / 14363 健康，21615 峰值 8.50 GiB + prefill **375.9 s**（换页断崖） | 同上 |
-| `exp_needle.py` | **信息过载下的选择性**：4 条同形事实（只有地点与号码不同）埋在不同深度、各问一次 -> 1894/3665/7291/**12728** token 全部 **4/4、零挑错**。`--kv` 可给**多个**（`fp16 int4 int4res int4k int4v`），在同一进程同一轮里轮着跑 —— 跨时间点的速度不可比，见 AGENTS.md 第七节第 4 条 | `... exp_needle.py --lens 2048 4096 8192 14363 --max-len 14848 --kv fp16 int4` |
+| `exp_needle.py` | **信息过载下的选择性**：4 条同形事实（只有地点与号码不同）埋在不同深度、各问一次 -> 1894/3665/7291/**12728** token 全部 **4/4、零挑错**。`--kv` 可给**多个**（`fp16 int4 int4res int4k int4v`），在同一进程同一轮里轮着跑 —— 跨时间点的速度不可比，见 AGENTS.md 第六节第 4 条 | `... exp_needle.py --lens 2048 4096 8192 14363 --max-len 14848 --kv fp16 int4` |
 
 **第五轮新增的坑：**
 
