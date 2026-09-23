@@ -15,7 +15,7 @@
 | 代码 | ✅ **S0-S4 全部完成 + 速度路径 ①/② + KV int4 测量 + P0 解码分桶**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码（**分桶：`BUCKETS`/`for_length`/`grow`**）+ 4-bit lm_head + L0 记忆 `memory.py` + KV 量化 `kvquant.py`）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、**`src/s4_memory_demo.py`**、`tests/`（**60 passed**）、`src/bench_nova.py`、`src/bench_graph.py`、`src/bench_memory.py`、`src/diagnostics/`（速度归因 + 记忆诊断 + KV 量化诊断 + **重捕/分桶诊断**） |
 | 环境 | ✅ torch 2.6.0+cu124 + 权重 **8.89 GB 已缓存**（`.hf-cache`）；基线 4-bit 峰值 **2.79 GiB**；**Nova 单通路图解码 14.0 ms/token（71.3 tok/s，3.28 GiB）/ 双通路 22.7 ms/token（44.0 tok/s，4.83 GiB）** |
 | 代码托管 | ✅ **<https://github.com/captain-wangrun-cn/Nova>**（**public**，默认分支 `main`）。提交规范见 [AGENTS.md](AGENTS.md) 第七节 |
-| 下一步 | **第五轮**：**E1** ✅ 不 adopt → **E2** ✅ 不 adopt → **E3** ✅ 通过（改选 int8）→ **E5** ✅ 结案 → **E4** ✅ 通过（int8 可写核、int4 结案）→ **E6** PCIe/主机内存分层（**只剩这一条**）；然后 **S5 · 数据与蒸馏**（里程碑 2 起点） |
+| 下一步 | **第五轮已全部结案**：E1 ❌不 adopt · E2 ❌不 adopt · E3 ✅改选 int8 · E4 ✅int8 可写核/int4 结案 · E5 ✅尺子升级 · E6 ✅预取落地 · P0 ✅解码分桶。**接下来**：①写 int8 融合注意力核（D38+D40 已把靶子定死）②记忆段接 SegmentPrefetcher ③**S5 · 数据与蒸馏**（里程碑 2 起点） |
 
 **一句话：设计做完了，现在要开始证明"双通路 + 内部记忆"在 8GB 显存上真的能跑。**
 
@@ -357,6 +357,22 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 ---
 
 ## 七、S4 · 记忆最小实现（✅ 已完成 2026-09-22 —— **8/8 取回，跨进程可复现**）
+## 六·补十 · E6 主机内存分层（✅ 2026-09-23 —— **预取写法落地 2.55x；并行上限 5.3%**）
+
+**报告：[reports/kv-tiering.md](reports/kv-tiering.md) · 决策 D41 · 代码 `src/nova/prefetch.py` · 探针 `src/diagnostics/probe_kv_tiering.py`**
+
+| 项 | 结果 |
+|---|---|
+| 朴素 `read()` + H2D | 1.76 GiB/s |
+| **pin + `readinto` + 双缓冲 + `non_blocking`** | **4.49 GiB/s（2.55x）** ✅ 达标（判据 ≥4.5） |
+| 显存读 / H2D / 两条 stream 同时 | 4.3 ms / 80.4 ms / **80.5 ms** ⇒ **并行效率 1.00x max** |
+| 白赚上限 = PCIe/显存带宽 | 12.2 / 231.1 = **5.3%**（与侧会话一致） |
+
+- **A 段进生产路径**：加载记忆段只有这一种写法（先发 H2D 再读下一段，顺序不能反）。
+- **B 段二级优先**：并行成立但只有 5.3%（理想）/ ~20%（显存没打满）的免费额度 ⇒ 排在"把显存侧打满"之后。
+- 待实测：接进 `memory.py` 检索路径的端到端延迟。
+
+---
 
 **报告：[reports/s4-memory-min.md](reports/s4-memory-min.md) · 决策 D31 · 演示 `src/s4_memory_demo.py` · 基准 `src/bench_memory.py`**
 
