@@ -15,7 +15,7 @@
 | 代码 | ✅ **S0-S4 全部完成 + 速度路径 ①/② + KV int4 测量 + P0 解码分桶**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码（**分桶：`BUCKETS`/`for_length`/`grow`**）+ 4-bit lm_head + L0 记忆 `memory.py` + KV 量化 `kvquant.py`）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、**`src/s4_memory_demo.py`**、`tests/`（**60 passed**）、`src/bench_nova.py`、`src/bench_graph.py`、`src/bench_memory.py`、`src/diagnostics/`（速度归因 + 记忆诊断 + KV 量化诊断 + **重捕/分桶诊断**） |
 | 环境 | ✅ torch 2.6.0+cu124 + 权重 **8.89 GB 已缓存**（`.hf-cache`）；基线 4-bit 峰值 **2.79 GiB**；**Nova 单通路图解码 14.0 ms/token（71.3 tok/s，3.28 GiB）/ 双通路 22.7 ms/token（44.0 tok/s，4.83 GiB）** |
 | 代码托管 | ✅ **<https://github.com/captain-wangrun-cn/Nova>**（**public**，默认分支 `main`）。提交规范见 [AGENTS.md](AGENTS.md) 第七节 |
-| 下一步 | **第五轮 · 五条证伪实验 + PCIe/主机内存分层**（顺序与门控见第六·补四节）：**E1** ✅ 已结案（不 adopt，见第六·补五）→ **E2** 免费版滑窗（W ∈ {1024,2048,4096}；16K 全量基线 + 32K/64K 滑窗；**必测滑窗下的 S4 记忆取回**）→ **E3** 8 位 KV 对照 → **E4** 窄化 Triton 证伪（M=1 解包微基准）→ **E5** 干扰项 4/16/64 → **E6** PCIe/主机内存分层；然后 **S5 · 数据与蒸馏**（里程碑 2 起点） |
+| 下一步 | **第五轮 · 五条证伪实验 + PCIe/主机内存分层**（见第六·补四节）：**E1** ✅ 已结案（不 adopt）→ **E2** ✅ 已结案（不 adopt，见第六·补六）→ **E3** 8 位 KV 对照（**下一步**）→ **E4** 窄化 Triton 证伪（M=1 解包微基准）→ **E5** 干扰项 4/16/64 → **E6** PCIe/主机内存分层；然后 **S5 · 数据与蒸馏**（里程碑 2 起点） |
 
 **一句话：设计做完了，现在要开始证明"双通路 + 内部记忆"在 8GB 显存上真的能跑。**
 
@@ -304,7 +304,27 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 
 **下一步的替代方向（都还没测）**：查询相关的粗筛 + 小集合内精确重排；或把 K 压小但**别丢 token**（**E3** 覆盖量化那条）。
 
---- ## 七、S4 · 记忆最小实现（✅ 已完成 2026-09-22 —— **8/8 取回，跨进程可复现**）
+---
+
+## 六·补六 · E2 滑动窗口（✅ 2026-09-23 —— **不 adopt：质量崩、代价还是反的**）
+
+**报告：[reports/swa-window.md](reports/swa-window.md) · 决策 D37 · 代码 `src/nova/cache.py`（`WindowedKVCache`）+ `decode.py`/`layers.py`/`model.py` · 测试 `tests/test_swa.py`（6 条）**
+
+**已核查：**
+
+1. **质量门控未过**：每 4 层 1 全局 + W ∈ {1024,2048,4096}，在 **7.3K 与 14.5K** 上下文上 **全部 0/4**（全量基线 4/4）；32K 档 0/4。
+2. **不是单纯的"截断"**：**W=8192（盖住整段 7.3K）时 4/4** ⇒ ring/掩码/分块实现都对；而 W=4096 时**落在窗口内的两条事实也没答出** ⇒ 检索需要足够多的层同时看到关键 token（9/36 不够）。机制归因标 **推测**。
+3. **提高全局层比例会把"答不出"变成"答错"**：每 2 层 1 全局 + W=4096 → 1/4 正确、**3/4 挑错**（答成另一条形近事实）。信息过载下这比"想不起来"更糟。
+4. **滑窗下的 S4 记忆取回 7/8 → 5/8**（3710 token 上下文，注入的记忆掉出局部层窗口）。
+5. **代价方向是反的**：KV 省 40–67%，但 **prefill 更慢**（加性窗口掩码把因果稀疏性变成稠密读）：7.3K 档 5.6 s vs 全量 4.1 s；29K 档 **180.3 s**（同长度因果外推约 35 s）。峰值也没降（7.63 GiB @32K）。
+6. 顺带修一个真 bug：`prefill` 把 ring 的 `first` 覆盖成 `offset` ⇒ S4 记忆注入路径上局部层窗口被清空（**所有问题都答不出**）；`test_second_prefill_keeps_window` 已钉住。
+
+**对 260K 的结论**：**"少看 token"这条路（滑窗 / 丢 token）在不训练的前提下被证伪**，重心回到
+**"不看少、但看便宜"** ⇒ **E3（8 位 KV，不丢 token）→ E4（融合核）**，以及里程碑 2 的训练侧压缩。
+另有一条实现约束：**带状注意力不能靠加性掩码实现**，真要做窗口得让内核跳过窗口外的块。
+
+---
+
 ## 七、S4 · 记忆最小实现（✅ 已完成 2026-09-22 —— **8/8 取回，跨进程可复现**）
 
 **报告：[reports/s4-memory-min.md](reports/s4-memory-min.md) · 决策 D31 · 演示 `src/s4_memory_demo.py` · 基准 `src/bench_memory.py`**
@@ -377,9 +397,9 @@ $env:HF_HUB_OFFLINE='1'; $env:TRITON_CACHE_DIR=$env:TMP+'\triton-cache'; $env:TO
 | `HANDOFF.md` | 本文件：执行顺序与交接 |
 | `README.md` | 项目总览与文档索引 |
 | `docs/01` ~ `docs/16` | 设计文档（15 愿景 / 02 架构 / 03 记忆 / 11 路线图 / 13 决策 / 15 语言 / 16 模型解剖） |
-| `src/` | 代码（S0-S4 全部完成；`nova/` 是双通路骨架 + 图解码（**分桶**）+ L0 记忆 + KV 量化 `kvquant.py`，`chat.py` 交互 CLI，`diagnostics/` 是速度归因 + 记忆诊断 + KV 量化诊断 + **重捕/分桶诊断 `probe_graph_recapture.py`**） |
-| `tests/` | 单元测试（**60 passed**：`test_nova_skeleton.py` 8 条 + `test_graph_decode.py` 4 条 + `test_nf4_linear.py` 11 条 + `test_lm_head4.py` 5 条 + `test_memory.py` 12 条 + `test_kvquant.py` 13 条 + **`test_decode_mask_bucket.py` 6 条**） |
-| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / `speed-path1-nf4-gemv` / `s4-memory-min` / `long-context-attention` / `kv-int4` / **`decode-mask-bucket`**） |
+| `src/` | 代码（S0-S4 全部完成；`nova/` 是双通路骨架 + 图解码（**分桶**）+ **滑动窗口 `WindowedKVCache`** + L0 记忆 + KV 量化 `kvquant.py`，`chat.py` 交互 CLI，`diagnostics/` 是速度归因 + 记忆诊断 + KV 量化诊断 + 分桶/重捕诊断 + **路由/滑窗实验（`probe_memory_routing.py` / `exp_swa.py` / `probe_swa_memory.py`）**） |
+| `tests/` | 单元测试（**66 passed**：`test_nova_skeleton.py` 9 条 + `test_graph_decode.py` 4 条 + `test_nf4_linear.py` 11 条 + `test_lm_head4.py` 5 条 + `test_memory.py` 12 条 + `test_kvquant.py` 13 条 + `test_decode_mask_bucket.py` 6 条 + **`test_swa.py` 6 条**） |
+| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / `speed-path1-nf4-gemv` / `s4-memory-min` / `long-context-attention` / `kv-int4` / `decode-mask-bucket` / `memory-routing` / **`swa-window`**） |
 | `data/` | 评测集、训练数据（待建，**放 H 盘更大的话用软链接**） |
 | `models/` | 本地权重（建议只放软链接，实体在 `H:\hf-cache`） |
 
