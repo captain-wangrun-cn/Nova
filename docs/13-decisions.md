@@ -881,6 +881,47 @@
 
 ---
 
+## D44 · 记忆段接预取：走 safetensors 数据区偏移（方案 a），2.3 GiB 打满 4.49 GiB/s
+
+- **日期：** 2026-09-25
+- **背景：** E6（D41）落地了 `SegmentPrefetcher`，但接不进 `memory.py` —— 它搬**裸字节**，
+  而 **D07** 要求记忆以 **safetensors** 持久化。上一轮留了两条路，**一直卡在选哪条**。
+- **决策：选 (a)** —— 按 safetensors **数据区偏移**搬原始字节，再在显存里零拷贝建视图。
+  **不选 (b)（另存裸 blob）**，理由：**那是把同一份记忆存两遍**（真实记账 240 KiB/token，
+  1 万 token 就是 2.3 GiB），而且两份文件必须同步，迟早出现"预取的那份是旧的"。
+
+  走 (a) 之前先单独核查了三个前提（`src/diagnostics/probe_safetensors_layout.py`，已核查）：
+  ① 布局 = `[8B 头长 u64 LE][JSON 头][数据区]`、`data_offsets` 相对**数据区起点**；
+  ② 数据区里张量**连续无夹缝**（覆盖字节数 == 数据区长度）；
+  ③ 整段拷进一块 `uint8` 显存缓冲后 `slice.view(dtype).view(shape)` 能逐位还原。三条都成立。
+- **落地：**
+  1. `SegmentPrefetcher` 加 `offset` / `length`（数据区不在文件开头）与
+     `stream_into(dst)`（写进**预分配**缓冲，避免逐段新分配）；
+  2. `MemoryStore.load_prefetched()`：一次 H2D 搬完整段 + 全零拷贝建视图；
+  3. **D09 校验只写一份**（新增 `validate_memory_meta()`，`load()` 与 `load_prefetched()` 共用）——
+     两条路各写一份迟早会飘，那"宁可拒绝加载"就守不住了。
+- **验收（已核查）：**
+
+  | 文件 | 大小 | `safe_open` | `prefetch` | 倍数 | 带宽 |
+  |---|---:|---:|---:|---:|---:|
+  | 合成 1000 token | 234.4 MiB | 162.3 ms | **48.1 ms** | **3.37x** | 4.75 GiB/s |
+  | 合成 4000 token | 937.5 MiB | 725.6 ms | **239.0 ms** | **3.04x** | 3.83 GiB/s |
+  | 合成 10000 token | 2343.8 MiB | 1376.9 ms | **510.1 ms** | **2.70x** | **4.49 GiB/s** |
+  | S4 demo（真实） | 16.4 MiB | 17.0 ms | **5.5 ms** | **3.08x** | 2.90 GiB/s |
+
+  - **2.34 GiB 那行 = D41 实测上限（4.49 GiB/s），这条路径已打满**；两条路读出的张量**逐位相同**；
+  - `pytest tests -q` → **125 passed**（新增 `tests/test_memory_prefetch.py` 11 条）。
+- **踩到的坑（写进报告第四节）：** 基准的输入规模必须按**真实记账**算 —— 第一版按单通路 36 槽位
+  （144 KiB/token）造合成记忆，数字比真实更好看；真实是双通路 **60 槽位 = 240 KiB/token**。
+- **状态：** 已定（**第六轮 ②**；加载段完成，整条链路延迟待实测）
+- **关联：** [reports/memory-prefetch-load.md](../reports/memory-prefetch-load.md)；
+  `src/nova/prefetch.py`、`src/nova/memory.py`（`load_prefetched` / `read_safetensors_layout` /
+  `validate_memory_meta`）、`tests/test_memory_prefetch.py`（11 条）、
+  `src/diagnostics/bench_memory_load.py`、`probe_safetensors_layout.py`；
+  承接 D41（预取写法）与 D07（safetensors），不碰 D06/D09
+
+---
+
 ## 决策状态汇总
 
 > 正文按**追加顺序**排列（D38–D41 的编号与出现位置不一致是正常的 —— 本文件只追加，不改历史条目）。
@@ -930,3 +971,4 @@
 | D41 | 主机内存分层：预取写法落地（2.55x），并行上限 5.3% | 已定（**E6 结案**） |
 | D42 | int8 融合注意力核：ULP 级一致、16K 单层 7.53x；判据补 1e-5 绝对兜底 | 已定（**第六轮 ①**；解码路径接入待做） |
 | D43 | int8 流式 cache 接进解码路径：4K 整步 3.26x、KV 常驻 0.54x | 已定（**第六轮 ①.5**；8K 与真数据复核待做） |
+| D44 | 记忆段接预取：走 safetensors 数据区偏移（方案 a），2.3 GiB 打满 4.49 GiB/s | 已定（**第六轮 ②**；整条链路延迟待实测） |

@@ -43,8 +43,9 @@
    - safetensors 读写
    - 加载 / 保存 / 校验
    - 另加：`schema_digest` + `model_fingerprint` 不匹配**拒绝加载**（D09）
-4. ✅ **单元测试**（`pytest tests -q` → **114 passed**；第六轮 ① 新增 `test_kvattn.py` 21 条，
-   ①.5 新增 `test_kvattn_stream.py` 17 条 + `test_graph_decode_int8.py` 4 条）
+4. ✅ **单元测试**（`pytest tests -q` → **125 passed**；第六轮 ① 新增 `test_kvattn.py` 21 条，
+   ①.5 新增 `test_kvattn_stream.py` 17 条 + `test_graph_decode_int8.py` 4 条，
+   ② 新增 `test_memory_prefetch.py` 11 条）
    - ✅ 前向传播正确性
    - ✅ 显存占用达标（< 7GB）—— 双通路 + 记忆 + 1024 槽位 cache 峰值 **5.17 GiB**
    - ✅ 交叉注意力隔离性
@@ -175,6 +176,9 @@
    KV 常驻 **0.539x**、峰值 **6.68 GiB**。关键设计：长度走**显存标量**（图内可变），
    冻结成常量会**静默算错**而不是变慢。
    🧪 遗留：8K 端到端数字、真数据复核、S4 记忆注入不兼容、跨桶 `grow()` 不支持
-3. **记忆段接 `SegmentPrefetcher`** —— 预取写法已落地 **2.55x**（**D41**）；端到端延迟**待实测**
+3. ✅ **记忆段接 `SegmentPrefetcher`** —— 已完成（**D44**，[reports/memory-prefetch-load.md](../reports/memory-prefetch-load.md)）：
+   走 **safetensors 数据区偏移**（不另存裸 blob，守 D07）；2.34 GiB 从 1376.9 → **510.1 ms（2.70x）**，
+   带宽 **4.49 GiB/s = D41 上限**；两条路读出的张量**逐位相同**。
+   🧪 遗留：整条记忆链路（加载 → 检索 → 注入 → 出 token）的端到端延迟
 4. **S5 · 数据与蒸馏** —— 里程碑 2 起点；教师池已冻结（**D24**，v4 七层）；
    前置：训练平台选型（里程碑 0 唯一未勾项）+ D19（英文优先下是否重选基座）

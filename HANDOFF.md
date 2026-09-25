@@ -10,12 +10,12 @@
 | 项 | 状态 |
 |------|------|
 | 设计文档 | ✅ **16 份，3359 行**（`docs/01` ~ `docs/16`） |
-| 决策 | ✅ **43 条（D01–D43）**（`docs/13-decisions.md`）；D19 待定，D21/D22 已被 D23/D24 取代，**D26 技术归因已被 D27 更正**，**D30 取代 D29 第 2 条的路径排序**，**D32 更正 D31 的解读**，**D33 补充 D28 的成立条件**；第五轮新增 **D36（E1 路由不 adopt）/ D37（E2 滑窗不 adopt）/ D38（E3 改选 int8）/ D39（E5 判据升到 ≥16 条干扰）/ D40（E4 融合核：int8 可写、int4 结案）/ D41（E6 预取 2.55x）**；第六轮新增 **D42（int8 融合注意力核落地：ULP 级一致、16K 单层 7.53x）**、**D43（int8 流式 cache 接进解码路径：4K 整步 3.26x、KV 常驻 0.54x）** |
+| 决策 | ✅ **44 条（D01–D44）**（`docs/13-decisions.md`）；D19 待定，D21/D22 已被 D23/D24 取代，**D26 技术归因已被 D27 更正**，**D30 取代 D29 第 2 条的路径排序**，**D32 更正 D31 的解读**，**D33 补充 D28 的成立条件**；第五轮新增 **D36（E1 路由不 adopt）/ D37（E2 滑窗不 adopt）/ D38（E3 改选 int8）/ D39（E5 判据升到 ≥16 条干扰）/ D40（E4 融合核：int8 可写、int4 结案）/ D41（E6 预取 2.55x）**；第六轮新增 **D42（int8 融合注意力核落地：ULP 级一致、16K 单层 7.53x）**、**D43（int8 流式 cache 接进解码路径：4K 整步 3.26x、KV 常驻 0.54x）**、**D44（记忆段接预取：走 safetensors 数据区偏移，2.3 GiB 打满 4.49 GiB/s）** |
 | 教师选型 | ✅ **已冻结（v4 七层，D24）**，S5 直接执行，不要重新调研 |
-| 代码 | ✅ **S0-S4 全部完成 + 速度路径 ①/② + 第五轮 E1–E6 + P0 解码分桶 + 第六轮 ①/①.5 int8 融合核与流式 cache**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码（**分桶：`BUCKETS`/`for_length`/`grow`**）+ 4-bit lm_head + L0 记忆 `memory.py` + KV 量化 `kvquant.py`（int4 / int8 / fp8）+ 主机内存预取 `prefetch.py` + **int8 融合解码注意力核 + 流式 cache `kvattn.py`**）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、**`src/s4_memory_demo.py`**、`tests/`（**114 passed**）、`src/bench_nova.py`、`src/bench_graph.py`、`src/bench_memory.py`、`src/diagnostics/`（速度归因 + 记忆诊断 + KV 量化诊断 + 重捕/分桶诊断 + 路由 / 滑窗 / 分层探针 + 融合核基准 / 真数据 ULP 复核 + **端到端 int8 解码基准 / 显存标量探针**） |
+| 代码 | ✅ **S0-S4 全部完成 + 速度路径 ①/② + 第五轮 E1–E6 + P0 解码分桶 + 第六轮 ①/①.5/② int8 融合核与流式 cache + 记忆预取加载**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码（**分桶：`BUCKETS`/`for_length`/`grow`**）+ 4-bit lm_head + L0 记忆 `memory.py`（**`load_prefetched` 走数据区偏移**）+ KV 量化 `kvquant.py`（int4 / int8 / fp8）+ 主机内存预取 `prefetch.py`（**`offset`/`length`/`stream_into`**）+ **int8 融合解码注意力核 + 流式 cache `kvattn.py`**）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、**`src/s4_memory_demo.py`**、`tests/`（**125 passed**）、`src/bench_nova.py`、`src/bench_graph.py`、`src/bench_memory.py`、`src/diagnostics/`（速度归因 + 记忆诊断 + KV 量化诊断 + 重捕/分桶诊断 + 路由 / 滑窗 / 分层探针 + 融合核基准 / 真数据 ULP 复核 + **端到端 int8 解码基准 / 显存标量探针 / 记忆加载基准 / safetensors 布局探针**） |
 | 环境 | ✅ torch 2.6.0+cu124 + 权重 **8.89 GB 已缓存**（`.hf-cache`）；基线 4-bit 峰值 **2.79 GiB**；**Nova 单通路图解码 14.0 ms/token（71.3 tok/s，3.28 GiB）/ 双通路 22.7 ms/token（44.0 tok/s，4.83 GiB）**（均为**短上下文**数字） |
 | 代码托管 | ✅ **<https://github.com/captain-wangrun-cn/Nova>**（**public**，默认分支 `main`）。提交规范见 [AGENTS.md](AGENTS.md) 第六节 |
-| 下一步 | **第五轮已全部结案**：E1 ❌不 adopt · E2 ❌不 adopt · E3 ✅改选 int8 · E4 ✅int8 可写核/int4 结案 · E5 ✅尺子升级 · E6 ✅预取落地 · P0 ✅解码分桶。**第六轮 ① 与 ①.5 已结**（融合核 + 流式 cache 接进解码路径，D42/D43）。**接下来**：①记忆段接 `SegmentPrefetcher` 并量端到端延迟（**有设计待定，见六·补十三**）②int8 路径的 8K 端到端数字 + 真数据复核 ③**S5 · 数据与蒸馏**（里程碑 2 起点，前置：训练平台选型 + D19） |
+| 下一步 | **第五轮已全部结案**：E1 ❌不 adopt · E2 ❌不 adopt · E3 ✅改选 int8 · E4 ✅int8 可写核/int4 结案 · E5 ✅尺子升级 · E6 ✅预取落地 · P0 ✅解码分桶。**第六轮 ① / ①.5 / ② 已结**（融合核 → 流式 cache 接进解码路径 → 记忆段接预取，D42/D43/D44）。**接下来**：①int8 路径的 8K 端到端数字 + 真数据复核 ②整条记忆链路的端到端延迟（加载 → 检索 → 注入 → 出 token）③**S5 · 数据与蒸馏**（里程碑 2 起点，前置：训练平台选型 + D19） |
 
 **一句话：设计做完了，现在要开始证明"双通路 + 内部记忆"在 8GB 显存上真的能跑。**
 
@@ -449,6 +449,38 @@ $env:HF_ENDPOINT='https://hf-mirror.com'   # 直连不通时启用
 
 ---
 
+## 六·补十三 · 第六轮 ②：记忆段接预取（✅ 2026-09-25 —— **2.70–3.37x，2.3 GiB 打满 4.49 GiB/s**）
+
+**报告：[reports/memory-prefetch-load.md](reports/memory-prefetch-load.md) · 决策 D44 ·
+代码 `src/nova/memory.py`（`load_prefetched`）+ `src/nova/prefetch.py`（`offset`/`length`/`stream_into`）·
+测试 `tests/test_memory_prefetch.py`（11 条）· 基准 `src/diagnostics/bench_memory_load.py` ·
+布局核查 `probe_safetensors_layout.py`**
+
+**上一轮卡住的设计问题（现在有答案）**：`SegmentPrefetcher` 搬裸字节，而 **D07** 要求记忆以
+safetensors 持久化。两条路里**选 (a)：按数据区偏移搬原始字节**，不选 (b) 另存裸 blob ——
+**(b) 等于把同一份记忆存两遍**（真实记账 240 KiB/token，1 万 token = 2.3 GiB）。
+
+走 (a) 前先单独核查了三个前提（已核查）：布局 = `[8B 头长][JSON 头][数据区]`、
+张量**连续无夹缝**、整段拷进一块 `uint8` 缓冲后 `view` 能**逐位还原**。
+
+| 文件 | 大小 | `safe_open` | `prefetch` | 倍数 | 带宽 |
+|---|---:|---:|---:|---:|---:|
+| 合成 1000 token | 234.4 MiB | 162.3 ms | **48.1 ms** | **3.37x** | 4.75 GiB/s |
+| 合成 4000 token | 937.5 MiB | 725.6 ms | **239.0 ms** | **3.04x** | 3.83 GiB/s |
+| 合成 10000 token | 2343.8 MiB | 1376.9 ms | **510.1 ms** | **2.70x** | **4.49 GiB/s** |
+| S4 demo（真实） | 16.4 MiB | 17.0 ms | **5.5 ms** | **3.08x** | 2.90 GiB/s |
+
+- **2.34 GiB 那行 = D41 实测上限（4.49 GiB/s）⇒ 这条路径已打满**；两条路读出的张量**逐位相同**。
+- **D09 校验只写一份**（`validate_memory_meta`）：`load()` 与 `load_prefetched()` 共用判据。
+- ⚠️ **基准的输入规模必须按真实记账算**：第一版按单通路 36 槽位（144 KiB/token）造，
+  数字比真实更好看；真实是双通路 **60 槽位 = 240 KiB/token**。
+- ⚠️ `clocks.sm` 在这条基准里**不是主角**（瓶颈在盘读 + PCIe，不在 SM）：开始 210 MHz、
+  结束 2505 MHz，吞吐数字仍可比。与算力基准相反，别误读。
+- 🧪 **待实测**：整条记忆链路的端到端延迟（加载 → 检索 → 注入 → 出 token）；
+  检索那一步本身 ≈1× 基线前向（HANDOFF 第七节）。L0 的 2× 冗余与压缩仍未做。
+
+---
+
 ## 七、S4 · 记忆最小实现（✅ 已完成 2026-09-22 —— **8/8 取回，跨进程可复现**）
 
 **报告：[reports/s4-memory-min.md](reports/s4-memory-min.md) · 决策 D31 · 演示 `src/s4_memory_demo.py` · 基准 `src/bench_memory.py`**
@@ -522,8 +554,8 @@ $env:HF_HUB_OFFLINE='1'; $env:TRITON_CACHE_DIR=$env:TMP+'\triton-cache'; $env:TO
 | `README.md` | 项目总览与文档索引 |
 | `docs/01` ~ `docs/16` | 设计文档（15 愿景 / 02 架构 / 03 记忆 / 11 路线图 / 13 决策 / 15 语言 / 16 模型解剖） |
 | `src/` | 代码（S0-S4 全部完成；`nova/` 是双通路骨架 + 图解码（**分桶**）+ **滑动窗口 `WindowedKVCache`** + L0 记忆 + KV 量化 `kvquant.py` + **int8 融合核与流式 cache `kvattn.py`** + 预取 `prefetch.py`，`chat.py` 交互 CLI，`diagnostics/` 是速度归因 + 记忆诊断 + KV 量化诊断 + 分桶/重捕诊断 + 路由/滑窗实验 + **`bench_int8_attn.py` / `probe_kvattn_real.py` / `bench_int8_decode.py` / `probe_kvattn_scalar.py`**） |
-| `tests/` | 单元测试（**114 passed**：`test_nova_skeleton.py` 9 条 + `test_graph_decode.py` 4 条 + `test_nf4_linear.py` 11 条 + `test_lm_head4.py` 5 条 + `test_memory.py` 12 条 + `test_kvquant.py` 19 条 + `test_decode_mask_bucket.py` 6 条 + `test_swa.py` 6 条 + `test_kvattn.py` 21 条 + **`test_kvattn_stream.py` 17 条** + **`test_graph_decode_int8.py` 4 条**） |
-| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / `speed-path1-nf4-gemv` / `s4-memory-min` / `long-context-attention` / `kv-int4` / `decode-mask-bucket` / `memory-routing` / `swa-window` / `kv-quant-8bit` / `interference-scan` / `kv-unpack-bench` / `kv-tiering` / `kv-int8-fused-attn` / **`kv-int8-streaming-cache`**） |
+| `tests/` | 单元测试（**125 passed**：`test_nova_skeleton.py` 9 条 + `test_graph_decode.py` 4 条 + `test_nf4_linear.py` 11 条 + `test_lm_head4.py` 5 条 + `test_memory.py` 12 条 + `test_kvquant.py` 19 条 + `test_decode_mask_bucket.py` 6 条 + `test_swa.py` 6 条 + `test_kvattn.py` 21 条 + `test_kvattn_stream.py` 17 条 + `test_graph_decode_int8.py` 4 条 + **`test_memory_prefetch.py` 11 条**） |
+| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / `speed-path1-nf4-gemv` / `s4-memory-min` / `long-context-attention` / `kv-int4` / `decode-mask-bucket` / `memory-routing` / `swa-window` / `kv-quant-8bit` / `interference-scan` / `kv-unpack-bench` / `kv-tiering` / `kv-int8-fused-attn` / `kv-int8-streaming-cache` / **`memory-prefetch-load`**） |
 | `data/` | 评测集、训练数据（待建，**放 H 盘更大的话用软链接**） |
 | `models/` | 本地权重（建议只放软链接，实体在 `H:\hf-cache`） |
 
