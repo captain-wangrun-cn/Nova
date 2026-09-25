@@ -30,6 +30,7 @@ import torch
 import torch.nn.functional as F
 
 from .cache import StaticKVCache, WindowedKVCache
+from .kvattn import KVInt8Cache
 
 # ---- 容量分桶 ----
 
@@ -102,6 +103,7 @@ class GraphDecoder:
         batch: int = 1,
         device: str | torch.device = "cuda",
         dtype: torch.dtype = torch.float16,
+        quant: str = "off",
     ) -> None:
         self.model = model
         self.text = model.model
@@ -110,9 +112,16 @@ class GraphDecoder:
         self.batch = batch
         self.device = device
         self.dtype = dtype
+        # `quant="int8"`：KV 常驻只有 int8 + fp16 尾部环（①.5，见 reports/kv-int8-fused-attn.md）。
+        # `"off"` 保持 fp16 cache + SDPA（默认，行为逐位不变）。
+        if quant not in ("off", "int8"):
+            raise ValueError(f"quant 只支持 'off' / 'int8'，收到 {quant!r}")
+        self.quant = quant
 
         # 滑动窗口（E2）：`swa_window > 0` 时局部层只用 **2W** 个槽（ring），全局层仍按 max_len。
         self.swa_window = int(getattr(self.cfg, "swa_window", 0) or 0)
+        if self.quant == "int8" and self.swa_window:
+            raise ValueError("quant='int8' 目前不支持滑动窗口层（E2 未 adopt，两条路不叠加）")
         self.swa_chunk = int(getattr(self.cfg, "swa_chunk", 0) or 0) or self.swa_window
         if self.swa_window and self.swa_chunk > self.swa_window:
             raise ValueError(f"prefill 分块 {self.swa_chunk} 不能大于窗口 {self.swa_window}（ring 装不下）")
@@ -129,6 +138,18 @@ class GraphDecoder:
                 device=device,
             )
             self._win_arange = torch.arange(self.window_slots, dtype=torch.long, device=device)
+        elif self.quant == "int8":
+            self.cache = KVInt8Cache(
+                num_slots=self.text.num_cache_layers,
+                num_kv_heads=self.cfg.num_key_value_heads,
+                head_dim=self.cfg.head_dim,
+                max_len=max_len,
+                num_q_heads=self.cfg.num_attention_heads,
+                batch=batch,
+                dtype=dtype,
+                device=device,
+            )
+            self._win_arange = None
         else:
             self.cache = StaticKVCache(
                 num_slots=self.text.num_cache_layers,
@@ -226,6 +247,10 @@ class GraphDecoder:
         n = input_ids.shape[1]
         if n + offset > self.max_len:
             raise ValueError(f"prompt 长度 {n} + 起点 {offset} 超过 max_len {self.max_len}")
+        if hasattr(self.cache, "begin_prefill"):
+            # int8 流式 cache（①.5）：按**实际会写入的 token 数**建 fp16 暂存区
+            # （不按 max_len —— max_len=8192 的整段暂存区是 2.7 GiB，8GB 卡不能那么花）
+            self.cache.begin_prefill(offset + n)
         self.cache.pos.fill_(offset)
         if self.swa_window:
             # ring 的掩码靠 `first` 判断"哪些槽还没写过"；全长 cache 不需要。
@@ -241,6 +266,8 @@ class GraphDecoder:
             nc = min(chunk, n - c0)
             off = offset + c0
             self.cache.pos.fill_(off)
+            if hasattr(self.cache, "set_prefill_pos"):
+                self.cache.set_prefill_pos(off)   # int8 cache：pos 与暂存区游标都对齐到块起点
             # 非 0 起点、或开了滑窗（第 2 块起必然非 0 起点）时都要显式掩码：
             # 不能走 `is_causal` 那条路（它把 kv 截断到前 n 个槽位 = 前缀）。
             if off or self.swa_window:
@@ -258,6 +285,10 @@ class GraphDecoder:
                 cross_mode="off",
                 logits_to_keep=1,
             )
+        if hasattr(self.cache, "finish_prefill"):
+            # int8 流式 cache（①.5）：整段 prefill 结束后量化整组 + 填尾部环 + 释放暂存区。
+            # **不能每块量化**：分组的尺子要等 64 个 token 全到齐，跨块的组会被切坏。
+            self.cache.finish_prefill(offset + n)
         # ⚠️ 必须填**第一个生成 token**，不能填最后一个 prompt token：
         # prefill 已把整个 prompt 写进 cache（位置 offset..offset+n-1），pos 指向 offset+n。
         # 若填最后一个 prompt token，图的第一步会把它在位置 offset+n 上**再算一遍**。
@@ -317,6 +348,34 @@ class GraphDecoder:
             self.cache.key_cache[slot][:, :, t, :] = kk
             self.cache.value_cache[slot][:, :, t, :] = vv
 
+    # ---- int8 流式 cache 的 warmup 快照（①.5）----
+
+    def _save_int8_state(self):
+        """int8 cache 的**活状态**：`pos` / `first` / 三个设备标量 / 尾部环。
+
+        int8 数组不用存：warmup 写的组在复位后会由真实 replay 用同样的值再写一遍。
+        """
+        if self.quant != "int8":
+            return None
+        c = self.cache
+        return (c.pos.clone(), c.first.clone(), c._written.clone(), c._qlen.clone(), c._pg.clone(),
+                [t.clone() for t in c.tail_k], [t.clone() for t in c.tail_v])
+
+    def _restore_int8_state(self, saved) -> None:
+        if saved is None:
+            return
+        c = self.cache
+        pos, first, written, qlen, pg, tk, tv = saved
+        c.pos.copy_(pos)
+        c.first.copy_(first)
+        c._written.copy_(written)
+        c._qlen.copy_(qlen)
+        c._pg.copy_(pg)
+        for i, t in enumerate(tk):
+            c.tail_k[i].copy_(t)
+        for i, t in enumerate(tv):
+            c.tail_v[i].copy_(t)
+
     def capture(self, warmup: int = 3, pool: str | object = "off") -> None:
         """捕获。调用前必须先 `prefill()`（`pos` 决定图的起始位置）。
 
@@ -340,6 +399,10 @@ class GraphDecoder:
         self.model.eval()
         start = int(self.cache.pos.item())
         saved_ids = self.input_ids.clone()
+        if self.quant == "int8":
+            # 图内不该再有 fp16 暂存区（它在 `prefill` 的每块末尾就清空了）。
+            self.cache.release_staging()
+        saved_i8 = self._save_int8_state()
         # ⚠️ warmup 会**原地写** `warmup` 个位置。全长槽位无所谓（它们在 `pos` 之后，被掩码挡掉），
         # 但 ring 槽位会**覆盖掉窗口内的老 token**（槽 i 装的是"最近一次写到 i 的 token"，
         # 而掩码只认位置、不认内容）⇒ 必须先把要被动的那几个槽存下来，warmup 后写回。
@@ -358,6 +421,10 @@ class GraphDecoder:
         self.cache.pos.fill_(start)
         self.input_ids.copy_(saved_ids)
         self._restore_ring_slots(saved_ring)
+        self._restore_int8_state(saved_i8)
+        if self.quant == "int8":
+            # 解码步的长度信息全走**显存标量**（图内零 `.item()`），这里只需按 pos 重算一遍。
+            self.cache.refresh_scalars()
 
         g = torch.cuda.CUDAGraph()
         if pool == "off":
@@ -387,6 +454,11 @@ class GraphDecoder:
         new_max_len = int(new_max_len)
         if new_max_len <= self.max_len:
             return
+        if self.quant == "int8":
+            raise NotImplementedError(
+                "int8 cache 不支持跨桶 grow()（量化缓冲、尾部环、尺子都要重建）。"
+                "要更长上下文请直接 `GraphDecoder(model, max_len=..., quant='int8')` 建够大的桶。"
+            )
         used = int(self.cache.pos.item())
         first = int(self.cache.first.item()) if hasattr(self.cache, "first") else 0
         old = self.cache

@@ -125,6 +125,16 @@ class LeanAttention(nn.Module):
         query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
         if past_key_values is not None:
+            if hasattr(past_key_values, "attend"):
+                # int8 流式 cache（①.5）：写入只是把 KV 塞进 fp16 尾部环，
+                # 注意力由融合核 + 尾部 SDPA 直接算出来，**不返回整条 cache**
+                # （返回整条就等于把"省显存"又还回去了）。
+                past_key_values.update(key, value, self.layer_idx)
+                if query.shape[2] > 1:  # prefill 一块：变长 + 因果掩码，另一条路
+                    attn_output = past_key_values.attend_prefill(query, self.layer_idx)
+                else:
+                    attn_output = past_key_values.attend(query, self.layer_idx)
+                return self.o_proj(attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous())
             key, value = past_key_values.update(key, value, self.layer_idx)
 
         sdpa_kwargs: dict = {}
