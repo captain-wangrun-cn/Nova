@@ -922,6 +922,73 @@
 
 ---
 
+## D45 · D19 收口：维持 Qwen3-VL-4B；角色越界与 AI 味记入 S5 蒸馏目标
+
+- **日期：** 2026-09-25
+- **决策：**
+  1. **不换基座**，继续 Qwen3-VL-4B-Instruct。D19 的机器可判部分全过；Agent 通读 6 条英文 RP 输出后，判定失败面为 1/3（rp-03 的 4bit/8bit 两档），**未触发 D19 写死的"≥2/3 prompt 明显不可用"重估线**。
+  2. **S5 蒸馏数据新增两个明确目标**：① **角色边界**：只写模型自己角色的对白/动作/心理，不代写用户角色的对白/动作；② **反 AI 味**：清洗"didn't move / didn't speak / silence was thick / like a stone/thread"这类模板化句式，优先保留具体感官细节。
+  3. **量化不是当前主要问题**：4bit 与 8bit 在 rp-03 上同样越界，rp-01 的 8bit 反而出现同段重复；不要用"换 8bit 基座"解决 RP 质量问题。
+- **理由（Agent 通读，2026-09-25）：**
+  - 6/6 英文流畅、第三人称过去时、无中文/拒答/复读循环；5/6 可用。
+  - **rp-03（4bit + 8bit）**：整段聚焦买家，直接写出买家对白（"Forty percent. That's all I'm asking." / "Forty percent, and I'm not even mad."）和动作，违反 system prompt 的 "Never write the user's dialogue, thoughts, or actions"，且没有给出 Elara 的反应。判定为明确不可用。
+  - **rp-01 8bit**：同段两次写 "the ramp groaned under the weight of the van's tires"；**rp-02 8bit** 自创 lab / cover-up 剧情；两条都属于可修的风格/一致性问题。
+  - 这不是"基座英文不行"：句法、感官细节、角色内视角都在线，失败集中在**角色边界与模板化表达**，正是 S5 蒸馏要修的目标。
+- **状态：** 已定（**D19 收口**；训练平台选型成为 S5 唯一硬前置）
+- **关联：** [reports/d19-base-model-and-s5.md](../reports/d19-base-model-and-s5.md)；[reports/baseline-outputs.jsonl](../reports/baseline-outputs.jsonl)；承接 D16 / D19 / D24，不碰 D06/D07/D09/D17/D18
+
+---
+
+## D46 · 训练平台分阶段：本地 4060 先跑通，正式训练再上 Kaggle/云
+
+- **日期：** 2026-09-25
+- **决策：**
+  1. **S5 训练平台按阶段选**：① **本地 4060** 先做 **10 步训练 spike**（验证反向传播、显存、速度）；② 再做 **500-1000 条学生侧管线**（数据格式 / 清洗 / 训练入口 / 评估回路）；③ 管线定型后才上 **Kaggle 单张 T4 16GB 或云 24GB** 做正式训练。
+  2. **教师侧数据先用 API 教师生成**（D24 的 v4 七层；Gemini 3.8 Flash 为主，按层路由补 GLM/Kimi 等），因为 27B 4-bit 教师需要约 15-16GB，4060 跑不了。自部署 Qwen3.8-27B 留给后续放大。
+  3. **D17 的 8GB 约束只锁推理，不锁训练**：训练可以在 16GB/24GB 卡上做，最后把 LoRA（约 50-150MB）和 4-bit 基座拿回 4060 推理。
+- **理由：**
+  - 自写 Nova 前向还没有训练入口，`peft`/`trl`/`datasets` 未安装，Triton RMSNorm 是纯前向核；先在本地把梯度打通，调试成本最低。
+  - 4060 显存紧（双通路 4-bit 基座约 4.2-4.7GB；Stage A 交叉注意力+门控 330.36M 参数，8-bit Adam + 梯度检查点 + seq 512-1024 **推测可跑，待实测**）。
+  - S5 的验收标准是"500-1000 条跑通管线"，不是"训出模型"；先用 API 教师把数据侧跑通，不必先解决 24GB 卡和多卡分片。
+- **状态：** 已定（**训练平台选型**；S5 的硬前置已清）
+- **关联：** [reports/d19-base-model-and-s5.md](../reports/d19-base-model-and-s5.md) 第 2.2 节；承接 D17 / D18 / D24 / D45
+
+---
+
+## D47 · S5 API 教师 smoke test：Gemini 网关可用，5 条英文 RP 样本落盘
+
+- **日期：** 2026-09-26
+- **决策：**
+  1. **S5 教师数据走 OpenAI 兼容端点** `http://newapi.wr.wstudio.work/v1/chat/completions`，模型 `gemini-3.1-flash-lite`；本轮 smoke test 通过。
+  2. **生成脚本落地**：`src/s5_gen_samples.py`；样本写 `data/s5-samples/gemini-3.1-flash-lite.jsonl`（`data/*` 已 gitignore）。
+  3. **角色边界写进 system prompt**：明确"只写 Elara 自己的动作/心理，不写其他角色的对白/动作"；rp-03 复测不再代写买家对白，**D45 的失败模式在样本侧被修掉**。
+- **理由（实测）：**
+  - 5/5 HTTP 200，`finish_reason=stop`；词数 158/166/182/190/177；总 token 1537。
+  - 5/5 无中文；非 ASCII 只有 `’` 和 `—`（英文排版字符）；无 thinking 段。
+  - **安全边界**：网关 HTTPS 证书域名不匹配（`CERTIFICATE_VERIFY_FAILED`），当前走 HTTP，key 在 Authorization 头里明文传输；只在可信网络 / 自建网关上使用，不要提交 key。
+- **状态：** 已定（**S5 数据管线 smoke test**；样本可直接用于 D46 的 10 步训练 spike）
+- **关联：** [reports/s5-gemini-smoke.md](../reports/s5-gemini-smoke.md)；`src/s5_gen_samples.py`；承接 D24 / D45 / D46
+
+---
+
+## D48 · S5 本地 10 步训练 spike 通过：4-bit 基座反向可用，Stage A 可训
+
+- **日期：** 2026-09-26
+- **决策：**
+  1. **本地 4060 训练可行性成立**：4-bit bnb 基座 + 自写 Nova 双通路可以反向传播；基座保持冻结（`base_grads=0`）。
+  2. **Stage A 只训 `cross_blocks`**（交叉注意力 + 门控 + 预测器，330,362,892 参数）；训练必须用 `cross_mode="predictive"`；`"on"` 模式会让 24/102 个预测器张量没有梯度。
+  3. **梯度检查点 + PagedAdam8bit 是本地 8GB 的必选项**：无检查点（seq 301）峰值 allocated 7.12 GiB / reserved 7.24 GiB；最长样本 356 用检查点后峰值 **5.45 / 7.07 GiB**。
+  4. **下一步进入 500-1000 条数据管线**；本地 reserved 已接近 8GB，长上下文 / 大 batch 留给 Kaggle 或云。
+- **理由（实测）：**
+  - 10 步（2 warmup + 10 measured，5 条样本循环）：loss **1.9595 → 0.7702**；`grad_none` **0/102**；`base_grads` **0**。
+  - step 中位 **0.889 s**（0.821-1.278 s），`clocks.sm` **2280-2475 MHz**；峰值 allocated **5.45 GiB** / reserved **7.07 GiB**。
+  - checkpoint：`.tmp/s5-train-spike/cross_blocks.pt`（660,765,112 B）；结果：`reports/s5-train-spike-results.json`。
+  - `pytest tests -q` → **126 passed**（新增 `tests/test_train_spike.py` 1 条；梯度检查点默认关闭，推理路径不变）。
+- **状态：** 已定（**D46 第 1 步完成**；下一步 S5 数据管线）
+- **关联：** [reports/s5-train-spike.md](../reports/s5-train-spike.md)；`src/s5_train_spike.py`、`src/diagnostics/probe_train_backward.py`、`src/nova/model.py`（`gradient_checkpointing` 开关）、`tests/test_train_spike.py`；承接 D46 / D47
+
+---
+
 ## 决策状态汇总
 
 > 正文按**追加顺序**排列（D38–D41 的编号与出现位置不一致是正常的 —— 本文件只追加，不改历史条目）。
@@ -946,7 +1013,7 @@
 | D16 | 基座 Qwen3-VL-4B | 已定 |
 | D17 | 硬件先用 4060 | 已定 |
 | D18 | 先英文后中文 | 已定 |
-| D19 | 英文优先下是否重选基座 | 待定 |
+| D19 | 英文优先下是否重选基座 | ✅ 已收口（D45：不换基座） |
 | D20 | 蒸馏教师按环节分配（A/B 两档） | 已定 |
 | D21 | 前沿闭源模型三层使用边界 | ⚠️ 已由 D23 取代 |
 | D22 | 混合蒸馏配方 v2（四层教师 + 无审查层） | ⚠️ 已由 D23/D24 取代（见 v4） |
@@ -972,3 +1039,7 @@
 | D42 | int8 融合注意力核：ULP 级一致、16K 单层 7.53x；判据补 1e-5 绝对兜底 | 已定（**第六轮 ①**；解码路径接入待做） |
 | D43 | int8 流式 cache 接进解码路径：4K 整步 3.26x、KV 常驻 0.54x | 已定（**第六轮 ①.5**；8K 与真数据复核待做） |
 | D44 | 记忆段接预取：走 safetensors 数据区偏移（方案 a），2.3 GiB 打满 4.49 GiB/s | 已定（**第六轮 ②**；整条链路延迟待实测） |
+| D45 | D19 收口：维持 Qwen3-VL-4B；角色越界与 AI 味记入 S5 蒸馏目标 | 已定（**D19 收口**） |
+| D46 | 训练平台分阶段：本地 4060 先跑通，正式训练再上 Kaggle/云 | 已定（**训练平台选型**） |
+| D47 | S5 API 教师 smoke test：Gemini 网关可用，5 条英文 RP 样本落盘 | 已定（**S5 数据管线 smoke test**） |
+| D48 | S5 本地 10 步训练 spike 通过：4-bit 基座反向可用，Stage A 可训 | 已定（**D46 第 1 步完成**） |

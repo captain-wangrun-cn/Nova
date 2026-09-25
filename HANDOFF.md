@@ -10,12 +10,12 @@
 | 项 | 状态 |
 |------|------|
 | 设计文档 | ✅ **16 份，3359 行**（`docs/01` ~ `docs/16`） |
-| 决策 | ✅ **44 条（D01–D44）**（`docs/13-decisions.md`）；D19 待定，D21/D22 已被 D23/D24 取代，**D26 技术归因已被 D27 更正**，**D30 取代 D29 第 2 条的路径排序**，**D32 更正 D31 的解读**，**D33 补充 D28 的成立条件**；第五轮新增 **D36（E1 路由不 adopt）/ D37（E2 滑窗不 adopt）/ D38（E3 改选 int8）/ D39（E5 判据升到 ≥16 条干扰）/ D40（E4 融合核：int8 可写、int4 结案）/ D41（E6 预取 2.55x）**；第六轮新增 **D42（int8 融合注意力核落地：ULP 级一致、16K 单层 7.53x）**、**D43（int8 流式 cache 接进解码路径：4K 整步 3.26x、KV 常驻 0.54x）**、**D44（记忆段接预取：走 safetensors 数据区偏移，2.3 GiB 打满 4.49 GiB/s）** |
+| 决策 | ✅ **48 条（D01–D48）**（`docs/13-decisions.md`）；**D19 已收口（D45：不换基座）**、**训练平台已定（D46：本地 4060 先跑通，正式训练再上 Kaggle/云）**、**S5 API 教师 smoke test 已过（D47：5 条英文 RP 样本落盘）**、**本地 10 步训练 spike 已过（D48：4-bit 基座反向可用，Stage A 可训）**，D21/D22 已被 D23/D24 取代，**D26 技术归因已被 D27 更正**，**D30 取代 D29 第 2 条的路径排序**，**D32 更正 D31 的解读**，**D33 补充 D28 的成立条件**；第五轮新增 **D36（E1 路由不 adopt）/ D37（E2 滑窗不 adopt）/ D38（E3 改选 int8）/ D39（E5 判据升到 ≥16 条干扰）/ D40（E4 融合核：int8 可写、int4 结案）/ D41（E6 预取 2.55x）**；第六轮新增 **D42（int8 融合注意力核落地：ULP 级一致、16K 单层 7.53x）**、**D43（int8 流式 cache 接进解码路径：4K 整步 3.26x、KV 常驻 0.54x）**、**D44（记忆段接预取：走 safetensors 数据区偏移，2.3 GiB 打满 4.49 GiB/s）**、**D45（D19 收口：维持 Qwen3-VL-4B；角色越界与 AI 味记入 S5 蒸馏目标）**、**D46（训练平台分阶段：本地 4060 先跑通，正式训练再上 Kaggle/云）**、**D47（S5 API 教师 smoke test：Gemini 网关可用，5 条英文 RP 样本落盘）**、**D48（S5 本地 10 步训练 spike 通过：4-bit 基座反向可用，Stage A 可训）** |
 | 教师选型 | ✅ **已冻结（v4 七层，D24）**，S5 直接执行，不要重新调研 |
 | 代码 | ✅ **S0-S4 全部完成 + 速度路径 ①/② + 第五轮 E1–E6 + P0 解码分桶 + 第六轮 ①/①.5/② int8 融合核与流式 cache + 记忆预取加载**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码（**分桶：`BUCKETS`/`for_length`/`grow`**）+ 4-bit lm_head + L0 记忆 `memory.py`（**`load_prefetched` 走数据区偏移**）+ KV 量化 `kvquant.py`（int4 / int8 / fp8）+ 主机内存预取 `prefetch.py`（**`offset`/`length`/`stream_into`**）+ **int8 融合解码注意力核 + 流式 cache `kvattn.py`**）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、**`src/s4_memory_demo.py`**、`tests/`（**125 passed**）、`src/bench_nova.py`、`src/bench_graph.py`、`src/bench_memory.py`、`src/diagnostics/`（速度归因 + 记忆诊断 + KV 量化诊断 + 重捕/分桶诊断 + 路由 / 滑窗 / 分层探针 + 融合核基准 / 真数据 ULP 复核 + **端到端 int8 解码基准 / 显存标量探针 / 记忆加载基准 / safetensors 布局探针**） |
 | 环境 | ✅ torch 2.6.0+cu124 + 权重 **8.89 GB 已缓存**（`.hf-cache`）；基线 4-bit 峰值 **2.79 GiB**；**Nova 单通路图解码 14.0 ms/token（71.3 tok/s，3.28 GiB）/ 双通路 22.7 ms/token（44.0 tok/s，4.83 GiB）**（均为**短上下文**数字） |
 | 代码托管 | ✅ **<https://github.com/captain-wangrun-cn/Nova>**（**public**，默认分支 `main`）。提交规范见 [AGENTS.md](AGENTS.md) 第六节 |
-| 下一步 | **第五轮已全部结案**：E1 ❌不 adopt · E2 ❌不 adopt · E3 ✅改选 int8 · E4 ✅int8 可写核/int4 结案 · E5 ✅尺子升级 · E6 ✅预取落地 · P0 ✅解码分桶。**第六轮 ① / ①.5 / ② 已结**（融合核 → 流式 cache 接进解码路径 → 记忆段接预取，D42/D43/D44），**D19 与 S5 就绪评估已落盘**（[reports/d19-base-model-and-s5.md](reports/d19-base-model-and-s5.md)）。**接下来**：①**你读 6 条英文 RP 输出**给 D19 收口（机器部分已全过）②**训练平台选型**（S5 的唯一硬前置；建议先本地 4060 跑通管线）③int8 路径的 8K 端到端数字 + 真数据复核 ④整条记忆链路的端到端延迟 |
+| 下一步 | **第五轮已全部结案**：E1 ❌不 adopt · E2 ❌不 adopt · E3 ✅改选 int8 · E4 ✅int8 可写核/int4 结案 · E5 ✅尺子升级 · E6 ✅预取落地 · P0 ✅解码分桶。**第六轮 ① / ①.5 / ② 已结**（融合核 → 流式 cache 接进解码路径 → 记忆段接预取，D42/D43/D44），**D19 与 S5 就绪评估已落盘**（[reports/d19-base-model-and-s5.md](reports/d19-base-model-and-s5.md)），**D19 已收口（D45：不换基座）**、**训练平台已定（D46：本地 4060 先跑通，正式训练再上 Kaggle/云）**、**API 教师 smoke test 已过（D47：5 条英文 RP 样本可用）**、**本地 10 步训练 spike 已过（D48：4-bit 基座反向可用，Stage A 可训）**。**接下来**：①**S5 500-1000 条数据管线**（API 教师生成 + 清洗 + 训练入口 + 评估回路）②int8 路径的 8K 端到端数字 + 真数据复核 ③整条记忆链路的端到端延迟 |
 
 **一句话：设计做完了，现在要开始证明"双通路 + 内部记忆"在 8GB 显存上真的能跑。**
 
@@ -525,10 +525,10 @@ $env:HF_HUB_OFFLINE='1'; $env:TRITON_CACHE_DIR=$env:TMP+'\triton-cache'; $env:TO
 | 事项 | 何时决定 | 说明 |
 |------|:---:|------|
 | ~~**速度路径 ①/②**~~ | ✅ **已定（D30）** | ①=自写 NF4 GEMV **已证伪并结案**（比 bnb 慢 1.31~2.75x）；②=量化 lm_head **已落地**（−2.0 ms/token）。**③/④ 融合注意力已由 D42/D43 结案**（int8 融合核 + 流式 cache） |
-| **D19 是否换基座** | **等你读 6 条 RP 输出**（2026-09-25 更新） | **机器可判部分已全过**（188–202 词 / 零复读 / 零中文 / 零拒答，见 [reports/d19-base-model-and-s5.md](reports/d19-base-model-and-s5.md)）。**建议不换**，但要你确认；触发重估的条件已写死（≥2/3 prompt 明显不可用） |
+| ~~**D19 是否换基座**~~ | ✅ **已定（D45，2026-09-25）** | **不换基座**：机器可判部分全过；Agent 通读 6 条后判定 1/3 有明确角色越界（rp-03 的 4bit/8bit 两档都写了买家的对白/动作），未触发 ≥2/3 重估线。角色边界与 AI 味记入 S5 蒸馏目标，见 [reports/d19-base-model-and-s5.md](reports/d19-base-model-and-s5.md) |
 | 双通路代码怎么起步：改 transformers 的 `modeling_qwen3_vl.py`，还是自己写一份 `nn.Module` | **S3 开始前** | 改动量大、要跟上游版本，但省掉权重映射；自写更干净但要自己写映射（见 [docs/16-model-anatomy.md](docs/16-model-anatomy.md) 第二节） |
 | 部署格式（PyTorch / 自定义引擎 / GGUF） | 里程碑 2 之后 | 自定义架构大概率不能用 GGUF |
-| **训练平台（4060 / Kaggle / 云）** | **S5 开工前**（里程碑 0 唯一未勾项） | 排序方案见 [reports/d19-base-model-and-s5.md](reports/d19-base-model-and-s5.md) 第 2.2 节：**建议先本地 4060 跑通 500-1000 条的管线**（S5 的验收标准是"跑通管线"，不是"训出模型"），管线定型后再上 Kaggle / 云 |
+| ~~**训练平台（4060 / Kaggle / 云）**~~ | ✅ **已定（D46，2026-09-25）** | **分阶段**：本地 4060 先做 10 步训练 spike + 500-1000 条学生侧管线；教师数据先用 API 教师生成（27B 4-bit 约 15-16GB，4060 跑不了）；正式训练再上 Kaggle T4 16GB 或云 24GB。D17 只锁推理，不锁训练 |
 
 ---
 
@@ -681,3 +681,35 @@ $env:HF_HUB_OFFLINE='1'; $env:TRITON_CACHE_DIR=$env:TMP+'\triton-cache'; $env:TO
 >
 > **下一步：** 把核接进解码路径 —— 需要 **int8 流式 cache**（当前组的尺子要等 64 token 写满才定，
 > KIVI 式"已量化段 + fp16 residual 窗口"）与 CUDA Graph 的形状恒定。**现在还没真省显存，省的是带宽。**
+
+---
+
+> **进度（2026-09-25 会话 · D19 收口）：** Agent 通读 6 条英文 RP 输出，按 D19 判据判定 **不换基座**（**D45**）。
+> 6/6 英文流畅、第三人称过去时、无中文/拒答/复读循环；**rp-03（4bit+8bit）越界写买家对白/动作**，
+> 是唯一明确不可用项，未触发 ≥2/3 重估线。**S5 蒸馏新增两个目标**：角色边界、反 AI 味模板。
+> **下一步：写本地 4060 的 10 步训练 spike 验收清单与代码**（D46；训练平台已定：本地先跑通，正式训练再上 Kaggle/云）。
+
+---
+
+> **进度（2026-09-25 会话 · 训练平台 D46）：** 用户确认按阶段执行：**本地 4060 先跑 10 步训练 spike
+> → 500-1000 条学生侧管线 → Kaggle/云正式训练**。教师数据先用 API 教师生成（D24 v4 七层），
+> 因为 27B 4-bit 教师约 15-16GB，4060 跑不了。**下一步：写 10 步 spike 的验收清单与代码。**
+
+---
+
+> **进度（2026-09-26 会话 · S5 API 教师 D47）：** `http://newapi.wr.wstudio.work` 的 OpenAI 兼容端点
+> + `gemini-3.1-flash-lite` smoke test 通过：5/5 `finish_reason=stop`，总 token 1537，无中文，
+> 非 ASCII 只有 `’` / `—`。**rp-03 的角色越界被新 system prompt 修掉**（只写 Elara，不代写买家）。
+> 产物：`src/s5_gen_samples.py` + `data/s5-samples/gemini-3.1-flash-lite.jsonl`（gitignored）。
+> ⚠️ 网关 HTTPS 证书域名不匹配，当前走 HTTP；key 只在可信网络使用，不要提交。
+> **下一步：用这 5 条样本跑本地 4060 的 10 步训练 spike。**
+
+---
+
+> **进度（2026-09-26 会话 · S5 本地训练 D48）：** 10 步 spike 通过（2 warmup + 10 measured）。
+> **4-bit bnb 基座反向可用，基座梯度 0**；只训 `cross_blocks` 330,362,892 参数，
+> `cross_mode="predictive"` + 梯度检查点 + `PagedAdam8bit`。loss 1.9595 → 0.7702；
+> step 中位 **0.889 s**，`clocks.sm` **2280-2475 MHz**；峰值 allocated **5.45 GiB** /
+> reserved **7.07 GiB**。checkpoint `.tmp/s5-train-spike/cross_blocks.pt`；
+> 报告 [reports/s5-train-spike.md](reports/s5-train-spike.md)；`pytest tests -q` → **126 passed**。
+> **下一步：S5 500-1000 条数据管线**（API 教师生成 + 清洗 + 训练入口 + 评估回路）。
