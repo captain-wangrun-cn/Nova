@@ -15,7 +15,7 @@
 | 代码 | ✅ **S0-S4 全部完成 + 速度路径 ①/② + 第五轮 E1–E6 + P0 解码分桶 + 第六轮 ①/①.5/② int8 融合核与流式 cache + 记忆预取加载**：**`src/nova/`**（双通路骨架 + 静态 KV cache + CUDA Graph 解码（**分桶：`BUCKETS`/`for_length`/`grow`**）+ 4-bit lm_head + L0 记忆 `memory.py`（**`load_prefetched` 走数据区偏移**）+ KV 量化 `kvquant.py`（int4 / int8 / fp8）+ 主机内存预取 `prefetch.py`（**`offset`/`length`/`stream_into`**）+ **int8 融合解码注意力核 + 流式 cache `kvattn.py`**）、**`src/chat.py`（交互 CLI，`--paths 1/2`）**、**`src/s4_memory_demo.py`**、`tests/`（**125 passed**）、`src/bench_nova.py`、`src/bench_graph.py`、`src/bench_memory.py`、`src/diagnostics/`（速度归因 + 记忆诊断 + KV 量化诊断 + 重捕/分桶诊断 + 路由 / 滑窗 / 分层探针 + 融合核基准 / 真数据 ULP 复核 + **端到端 int8 解码基准 / 显存标量探针 / 记忆加载基准 / safetensors 布局探针**） |
 | 环境 | ✅ torch 2.6.0+cu124 + 权重 **8.89 GB 已缓存**（`.hf-cache`）；基线 4-bit 峰值 **2.79 GiB**；**Nova 单通路图解码 14.0 ms/token（71.3 tok/s，3.28 GiB）/ 双通路 22.7 ms/token（44.0 tok/s，4.83 GiB）**（均为**短上下文**数字） |
 | 代码托管 | ✅ **<https://github.com/captain-wangrun-cn/Nova>**（**public**，默认分支 `main`）。提交规范见 [AGENTS.md](AGENTS.md) 第六节 |
-| 下一步 | **第五轮已全部结案**：E1 ❌不 adopt · E2 ❌不 adopt · E3 ✅改选 int8 · E4 ✅int8 可写核/int4 结案 · E5 ✅尺子升级 · E6 ✅预取落地 · P0 ✅解码分桶。**第六轮 ① / ①.5 / ② 已结**（融合核 → 流式 cache 接进解码路径 → 记忆段接预取，D42/D43/D44）。**接下来**：①int8 路径的 8K 端到端数字 + 真数据复核 ②整条记忆链路的端到端延迟（加载 → 检索 → 注入 → 出 token）③**S5 · 数据与蒸馏**（里程碑 2 起点，前置：训练平台选型 + D19） |
+| 下一步 | **第五轮已全部结案**：E1 ❌不 adopt · E2 ❌不 adopt · E3 ✅改选 int8 · E4 ✅int8 可写核/int4 结案 · E5 ✅尺子升级 · E6 ✅预取落地 · P0 ✅解码分桶。**第六轮 ① / ①.5 / ② 已结**（融合核 → 流式 cache 接进解码路径 → 记忆段接预取，D42/D43/D44），**D19 与 S5 就绪评估已落盘**（[reports/d19-base-model-and-s5.md](reports/d19-base-model-and-s5.md)）。**接下来**：①**你读 6 条英文 RP 输出**给 D19 收口（机器部分已全过）②**训练平台选型**（S5 的唯一硬前置；建议先本地 4060 跑通管线）③int8 路径的 8K 端到端数字 + 真数据复核 ④整条记忆链路的端到端延迟 |
 
 **一句话：设计做完了，现在要开始证明"双通路 + 内部记忆"在 8GB 显存上真的能跑。**
 
@@ -524,11 +524,11 @@ $env:HF_HUB_OFFLINE='1'; $env:TRITON_CACHE_DIR=$env:TMP+'\triton-cache'; $env:TO
 
 | 事项 | 何时决定 | 说明 |
 |------|:---:|------|
-| ~~**速度路径 ①/②**~~ | ✅ **已定（D30）** | ①=自写 NF4 GEMV **已证伪并结案**（比 bnb 慢 1.31~2.75x）；②=量化 lm_head **已落地**（−2.0 ms/token，见第六·补一节）。**余下：③ 融合 RoPE / 去冗余拷贝 → ④ 融合注意力**（靶子见 D38 + D40：写 **int8** 的核） |
-| D19 是否换基座 | **S2 基线出来之后** | 只有实测显示英文 RP 明显弱，才值得付出"中文保底"的代价 |
+| ~~**速度路径 ①/②**~~ | ✅ **已定（D30）** | ①=自写 NF4 GEMV **已证伪并结案**（比 bnb 慢 1.31~2.75x）；②=量化 lm_head **已落地**（−2.0 ms/token）。**③/④ 融合注意力已由 D42/D43 结案**（int8 融合核 + 流式 cache） |
+| **D19 是否换基座** | **等你读 6 条 RP 输出**（2026-09-25 更新） | **机器可判部分已全过**（188–202 词 / 零复读 / 零中文 / 零拒答，见 [reports/d19-base-model-and-s5.md](reports/d19-base-model-and-s5.md)）。**建议不换**，但要你确认；触发重估的条件已写死（≥2/3 prompt 明显不可用） |
 | 双通路代码怎么起步：改 transformers 的 `modeling_qwen3_vl.py`，还是自己写一份 `nn.Module` | **S3 开始前** | 改动量大、要跟上游版本，但省掉权重映射；自写更干净但要自己写映射（见 [docs/16-model-anatomy.md](docs/16-model-anatomy.md) 第二节） |
 | 部署格式（PyTorch / 自定义引擎 / GGUF） | 里程碑 2 之后 | 自定义架构大概率不能用 GGUF |
-| 训练平台（4060 / Kaggle / 云） | S3 通过之后 | 先本地小规模，云端按需 |
+| **训练平台（4060 / Kaggle / 云）** | **S5 开工前**（里程碑 0 唯一未勾项） | 排序方案见 [reports/d19-base-model-and-s5.md](reports/d19-base-model-and-s5.md) 第 2.2 节：**建议先本地 4060 跑通 500-1000 条的管线**（S5 的验收标准是"跑通管线"，不是"训出模型"），管线定型后再上 Kaggle / 云 |
 
 ---
 
@@ -555,7 +555,7 @@ $env:HF_HUB_OFFLINE='1'; $env:TRITON_CACHE_DIR=$env:TMP+'\triton-cache'; $env:TO
 | `docs/01` ~ `docs/16` | 设计文档（15 愿景 / 02 架构 / 03 记忆 / 11 路线图 / 13 决策 / 15 语言 / 16 模型解剖） |
 | `src/` | 代码（S0-S4 全部完成；`nova/` 是双通路骨架 + 图解码（**分桶**）+ **滑动窗口 `WindowedKVCache`** + L0 记忆 + KV 量化 `kvquant.py` + **int8 融合核与流式 cache `kvattn.py`** + 预取 `prefetch.py`，`chat.py` 交互 CLI，`diagnostics/` 是速度归因 + 记忆诊断 + KV 量化诊断 + 分桶/重捕诊断 + 路由/滑窗实验 + **`bench_int8_attn.py` / `probe_kvattn_real.py` / `bench_int8_decode.py` / `probe_kvattn_scalar.py`**） |
 | `tests/` | 单元测试（**125 passed**：`test_nova_skeleton.py` 9 条 + `test_graph_decode.py` 4 条 + `test_nf4_linear.py` 11 条 + `test_lm_head4.py` 5 条 + `test_memory.py` 12 条 + `test_kvquant.py` 19 条 + `test_decode_mask_bucket.py` 6 条 + `test_swa.py` 6 条 + `test_kvattn.py` 21 条 + `test_kvattn_stream.py` 17 条 + `test_graph_decode_int8.py` 4 条 + **`test_memory_prefetch.py` 11 条**） |
-| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / `speed-path1-nf4-gemv` / `s4-memory-min` / `long-context-attention` / `kv-int4` / `decode-mask-bucket` / `memory-routing` / `swa-window` / `kv-quant-8bit` / `interference-scan` / `kv-unpack-bench` / `kv-tiering` / `kv-int8-fused-attn` / `kv-int8-streaming-cache` / **`memory-prefetch-load`**） |
+| `reports/` | 每步的产物与验收证据（`s0-environment` / `tokenizer-report` / `baseline-qwen3vl4b` / `s2-speed-diagnosis` / `s3-dual-path-skeleton` / `s3-graph-decode` / `speed-path1-nf4-gemv` / `s4-memory-min` / `long-context-attention` / `kv-int4` / `decode-mask-bucket` / `memory-routing` / `swa-window` / `kv-quant-8bit` / `interference-scan` / `kv-unpack-bench` / `kv-tiering` / `kv-int8-fused-attn` / `kv-int8-streaming-cache` / `memory-prefetch-load` / **`d19-base-model-and-s5`**） |
 | `data/` | 评测集、训练数据（待建，**放 H 盘更大的话用软链接**） |
 | `models/` | 本地权重（建议只放软链接，实体在 `H:\hf-cache`） |
 
