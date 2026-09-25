@@ -22,6 +22,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .config import NovaConfig
 from .cross import CrossPathBlock
@@ -121,6 +122,7 @@ class NovaTextModel(nn.Module):
         past_key_values: Any = None,
         cross_mode: str = "off",
         return_paths: bool = False,
+        gradient_checkpointing: bool = False,
         **kwargs: Any,
     ) -> Any:
         if (input_ids is None) == (inputs_embeds is None):
@@ -141,16 +143,28 @@ class NovaTextModel(nn.Module):
             )
         position_embeddings = self.rotary_emb(hidden, position_ids)
 
+        def run_layer(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+            """训练时按层重算激活；推理默认关闭，行为与原来逐位一致。"""
+            if gradient_checkpointing and self.training:
+                return checkpoint(
+                    layer,
+                    x,
+                    position_embeddings,
+                    attention_mask,
+                    window_mask,
+                    past_key_values,
+                    use_reentrant=False,
+                )
+            return layer(x, position_embeddings, attention_mask, window_mask, past_key_values)
+
         for layer in self.prefix_layers:
-            hidden = layer(hidden, position_embeddings, attention_mask, window_mask, past_key_values)
+            hidden = run_layer(layer, hidden)
 
         paths = [hidden] * self.config.num_paths if self.config.num_paths == 1 else [hidden, hidden.clone()]
 
         for i in range(self.config.num_path_layers):
             paths = [
-                self.path_layers[p][i](
-                    paths[p], position_embeddings, attention_mask, window_mask, past_key_values
-                )
+                run_layer(self.path_layers[p][i], paths[p])
                 for p in range(self.config.num_paths)
             ]
             if i in self.cross_indices:
@@ -160,7 +174,7 @@ class NovaTextModel(nn.Module):
         hidden = paths[0] if len(paths) == 1 else torch.stack(paths, dim=0).mean(dim=0)
 
         for layer in self.suffix_layers:
-            hidden = layer(hidden, position_embeddings, attention_mask, window_mask, past_key_values)
+            hidden = run_layer(layer, hidden)
 
         hidden = self.norm(hidden)
         return (hidden, path_states) if return_paths else hidden
