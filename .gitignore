@@ -25,3 +25,8 @@ reports/*.pt
 
 # 抓取的第三方网页原文（教师选型调研的原始输入，非项目产物）
 reports/web-*.txt
+
+# 本地密钥与凭证（绝不入库）
+.secrets/
+.env
+*.key
