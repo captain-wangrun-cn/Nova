@@ -1,0 +1,35 @@
+{
+  "created": "2026-09-25T16:36:54.226782+00:00",
+  "raw": "H:\\Nova\\data\\s5-samples\\batch50-raw.jsonl",
+  "total": 50,
+  "clean": 50,
+  "pass_rate": 1.0,
+  "by_category": {
+    "rp": {
+      "total": 30,
+      "clean": 30
+    },
+    "state": {
+      "total": 10,
+      "clean": 10
+    },
+    "tool": {
+      "total": 10,
+      "clean": 10
+    }
+  },
+  "finish_reason": {
+    "stop": 50
+  },
+  "flag_counts": {
+    "template_heavy": 1,
+    "ai_disclaimer": 1
+  },
+  "word_count": {
+    "min": 4,
+    "median": 170.5,
+    "max": 238
+  },
+  "total_tokens": 17197,
+  "failures": []
+}

@@ -106,23 +106,19 @@ def clean_completion(text: str) -> str:
     return text.strip()
 
 
-def generate_one(
+def generate_messages(
     client: httpx.Client,
     *,
     base_url: str,
     model: str,
     api_key: str,
-    system: str,
-    user: str,
+    messages: list[dict[str, str]],
     temperature: float,
     max_tokens: int,
 ) -> tuple[str, dict[str, Any]]:
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        "messages": messages,
         "temperature": temperature,
         "top_p": 0.9,
         "max_tokens": max_tokens,
@@ -146,6 +142,31 @@ def generate_one(
         "model": body.get("model", model),
     }
     return content, meta
+
+
+def generate_one(
+    client: httpx.Client,
+    *,
+    base_url: str,
+    model: str,
+    api_key: str,
+    system: str,
+    user: str,
+    temperature: float,
+    max_tokens: int,
+) -> tuple[str, dict[str, Any]]:
+    return generate_messages(
+        client,
+        base_url=base_url,
+        model=model,
+        api_key=api_key,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
 
 
 def main() -> None:
