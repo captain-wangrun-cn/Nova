@@ -52,6 +52,18 @@ from .layers import apply_rotary_pos_emb
 MEMORY_FORMAT = "nova-memory"
 MEMORY_FORMAT_VERSION = 1
 
+# safetensors 的 dtype 字符串 → torch dtype（只列本项目会写出的类型）
+_SF_DTYPES: dict[str, torch.dtype] = {
+    "F16": torch.float16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+    "BF16": torch.bfloat16,
+    "I64": torch.int64,
+    "I32": torch.int32,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
+
 
 class MemoryFormatError(ValueError):
     """记忆文件本身不合法（缺字段 / 版本不认识 / 形状不对）。"""
@@ -521,25 +533,11 @@ class MemoryStore:
             if not blob:
                 raise MemoryFormatError("文件头里没有 nova_memory 元数据 —— 不是 Nova 记忆文件？")
             meta = json.loads(blob)
-            if meta.get("format") != MEMORY_FORMAT:
-                raise MemoryFormatError(f"未知的记忆格式：{meta.get('format')!r}")
-            if int(meta.get("version", 0)) > MEMORY_FORMAT_VERSION:
-                raise MemoryFormatError(
-                    f"记忆格式版本 {meta.get('version')} 比本代码（{MEMORY_FORMAT_VERSION}）新，拒绝读取"
-                )
-            file_schema = MemorySchema(**meta["schema"])
-            if schema is not None and file_schema.digest != schema.digest:
-                raise MemorySchemaMismatch(
-                    f"记忆表示空间与当前模型不一致（D09）：文件 {file_schema.digest[:12]} vs 当前 {schema.digest[:12]}"
-                )
-            fp = meta.get("model_fingerprint")
-            if fingerprint is not None and fp is not None and fp != fingerprint and not allow_foreign:
-                raise MemorySchemaMismatch(
-                    f"记忆的模型指纹 {fp[:12]} 与当前权重 {fingerprint[:12]} 不一致（D09）——"
-                    " 确认无误可传 allow_foreign=True 强制加载"
-                )
+            # 校验逻辑**只写一份**（`validate_memory_meta`）：safetensors 头路径与预取路径
+            # 必须用同一套判据，否则两条路会飘（D09 的"宁可拒绝加载"就守不住了）。
+            file_schema, fp, foreign = validate_memory_meta(meta, schema, fingerprint, allow_foreign)
             store = cls(file_schema, fp)
-            store.foreign = bool(fp is not None and fingerprint is not None and fp != fingerprint)
+            store.foreign = foreign
             for i in range(int(meta["n_items"])):
                 label = None
                 items_meta = meta.get("items") or []
@@ -547,6 +545,164 @@ class MemoryStore:
                     label = items_meta[i].get("label")
                 store.add(f.get_tensor(f"item{i}.k"), f.get_tensor(f"item{i}.v"), label=label)
         return store
+
+    @classmethod
+    def load_prefetched(
+        cls,
+        path: str | Path,
+        schema: MemorySchema | None = None,
+        fingerprint: str | None = None,
+        device: str | torch.device = "cuda",
+        seg_bytes: int = 4 << 20,
+        ring: int = 4,
+        allow_foreign: bool = False,
+        verify: bool = False,
+    ) -> "MemoryStore":
+        """从磁盘加载记忆，走 **`SegmentPrefetcher` 双缓冲**（D41 的唯一正确写法）。
+
+        ## 与 `load()` 的区别
+
+        | | `load()`（`safe_open` 路径） | `load_prefetched()`（本方法） |
+        |---|---|---|
+        | 读法 | 逐张量 `get_tensor()` | **整段**原始字节（pin + `readinto` + 双缓冲 + `non_blocking`） |
+        | 盘读与 H2D | 串行 | **重叠**（先发 H2D，再读下一段） |
+        | 显存张量 | 每个张量独立分配 | **一块 uint8 缓冲 + 零拷贝视图** |
+        | D07 | ✅ safetensors | ✅ 同一个 safetensors，**不另存裸 blob**（按数据区偏移搬） |
+
+        ## 为什么快
+
+        侧会话实测：裸 `read()` + H2D **1.76 GiB/s**；pin + `readinto` + 双缓冲 + `non_blocking`
+        **4.49 GiB/s（2.55x）**。端到端数字见 [reports/memory-prefetch-load.md](../../reports/memory-prefetch-load.md)。
+
+        `verify=True` 额外用 `safe_open` 逐张量读一遍做**逐位比对**（验收用，会拖慢）。
+        """
+        from .prefetch import SegmentPrefetcher
+
+        path = Path(path)
+        if not path.exists():
+            raise MemoryFormatError(f"记忆文件不存在：{path}")
+        meta, data_start, layout = read_safetensors_layout(path)
+        file_schema, fp, foreign = validate_memory_meta(meta, schema, fingerprint, allow_foreign)
+
+        n_items = int(meta["n_items"])
+        want: list[tuple[str, tuple]] = []
+        for i in range(n_items):
+            for suf in ("k", "v"):
+                name = f"item{i}.{suf}"
+                if name not in layout:
+                    raise MemoryFormatError(f"文件头里缺少张量 {name}")
+                want.append((name, layout[name]))
+
+        store = cls(file_schema, fp)
+        store.foreign = foreign
+        if not want:
+            return store
+
+        lo = min(t[2] for _, t in want)
+        hi = max(t[3] for _, t in want)
+        total = hi - lo
+        buf = torch.empty(total, dtype=torch.uint8, device=device)
+        pf = SegmentPrefetcher(path, seg_bytes=seg_bytes, ring=ring,
+                               offset=data_start + lo, length=total)
+        moved = pf.stream_into(buf)
+        if moved != total:
+            raise MemoryFormatError(f"只搬运了 {moved} / {total} 字节")
+        if torch.device(device).type == "cuda":
+            torch.cuda.synchronize()
+
+        # 显存内**零拷贝建视图**：切片已连续，`view(dtype)` / `view(shape)` 都不复制
+        views = {name: buf[s - lo : e - lo].view(dt).view(shape)
+                 for name, (dt, shape, s, e) in want}
+        for i in range(n_items):
+            label = None
+            items_meta = meta.get("items") or []
+            if i < len(items_meta):
+                label = items_meta[i].get("label")
+            store.add(views[f"item{i}.k"], views[f"item{i}.v"], label=label)
+
+        if verify:
+            _verify_against_safe_open(path, store)
+        return store
+
+
+def _verify_against_safe_open(path: Path, store: "MemoryStore") -> None:
+    """验收用：用 `safe_open` 独立读一遍，与预取加载的结果**逐位比对**。"""
+    from safetensors import safe_open
+
+    with safe_open(str(path), framework="pt", device="cpu") as f:
+        names = set(f.keys())
+        for i, item in enumerate(store.items):
+            for suf, got in (("k", item.k), ("v", item.v)):
+                name = f"item{i}.{suf}"
+                if name not in names:
+                    raise MemoryFormatError(f"safe_open 里没有 {name}")
+                if not torch.equal(got.cpu(), f.get_tensor(name)):
+                    raise MemoryFormatError(f"预取加载的 {name} 与 safe_open 读到的**不一致**")
+
+
+# ---------------------------------------------------------------- safetensors 布局 / 预取加载
+
+
+def read_safetensors_layout(path: str | Path) -> tuple[dict, int, dict[str, tuple]]:
+    """只读**文件头**，返回 `(头部 JSON, 数据区起点, {张量名: (dtype, shape, rel_start, rel_end)})`。
+
+    `.safetensors` 布局 = `[8 字节头长 u64 LE][JSON 头][数据区]`；每个张量的
+    `data_offsets` 是**相对数据区起点**的字节区间。已核查（`probe_safetensors_layout.py`）：
+    本项目写出的文件里张量**连续、无夹缝**，所以"整段搬数据区 + 显存内建视图"是等价的。
+    """
+    import struct
+
+    path = Path(path)
+    with open(path, "rb") as fh:
+        raw = fh.read(8)
+        if len(raw) != 8:
+            raise MemoryFormatError(f"文件太短，读不出 safetensors 头长：{path}")
+        header_len = struct.unpack("<Q", raw)[0]
+        if header_len <= 0 or header_len > 256 * 1024 * 1024:
+            raise MemoryFormatError(f"safetensors 头长异常：{header_len}")
+        header = json.loads(fh.read(header_len).decode("utf-8"))
+
+    tensors: dict[str, tuple] = {}
+    for name, spec in header.items():
+        if name == "__metadata__":
+            continue
+        dt = _SF_DTYPES.get(spec["dtype"])
+        if dt is None:
+            raise MemoryFormatError(f"张量 {name} 的 dtype {spec['dtype']!r} 不支持")
+        s, e = spec["data_offsets"]
+        tensors[name] = (dt, tuple(spec["shape"]), int(s), int(e))
+    meta_raw = (header.get("__metadata__") or {}).get("nova_memory")
+    if not meta_raw:
+        raise MemoryFormatError("文件头里没有 nova_memory 元数据 —— 不是 Nova 记忆文件？")
+    # `safe_open().metadata()` 给的是字符串，这里保持一致（load() 也是 json.loads 字符串）
+    return json.loads(meta_raw), 8 + header_len, tensors
+
+
+def validate_memory_meta(
+    meta: dict,
+    schema: MemorySchema | None = None,
+    fingerprint: str | None = None,
+    allow_foreign: bool = False,
+) -> tuple[MemorySchema, str | None, bool]:
+    """校验 `_meta`（格式 / 版本 / D09 表示空间），返回 `(文件 schema, 指纹, 是否外来)`。"""
+    if meta.get("format") != MEMORY_FORMAT:
+        raise MemoryFormatError(f"未知的记忆格式：{meta.get('format')!r}")
+    if int(meta.get("version", 0)) > MEMORY_FORMAT_VERSION:
+        raise MemoryFormatError(
+            f"记忆格式版本 {meta.get('version')} 比本代码（{MEMORY_FORMAT_VERSION}）新，拒绝读取"
+        )
+    file_schema = MemorySchema(**meta["schema"])
+    if schema is not None and file_schema.digest != schema.digest:
+        raise MemorySchemaMismatch(
+            f"记忆表示空间与当前模型不一致（D09）：文件 {file_schema.digest[:12]} vs 当前 {schema.digest[:12]}"
+        )
+    fp = meta.get("model_fingerprint")
+    if fingerprint is not None and fp is not None and fp != fingerprint and not allow_foreign:
+        raise MemorySchemaMismatch(
+            f"记忆的模型指纹 {fp[:12]} 与当前权重 {fingerprint[:12]} 不一致（D09）——"
+            " 确认无误可传 allow_foreign=True 强制加载"
+        )
+    return file_schema, fp, bool(fp is not None and fingerprint is not None and fp != fingerprint)
 
 
 def _rope_cos_sin(rotary_emb, ref: torch.Tensor, start: int, n: int, hidden_size: int, batch: int = 1):
